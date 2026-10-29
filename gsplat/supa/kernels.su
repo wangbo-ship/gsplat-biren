@@ -1,0 +1,4437 @@
+// SPDX-FileCopyrightText: Copyright 2026 the Regents of the University of California, Nerfstudio Team and contributors. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+#include <supa.h>
+
+struct Mat3 {
+    float v[9];
+};
+
+struct Vec4 {
+    float v[4];
+};
+
+struct Vec3 {
+    float v[3];
+};
+
+struct Mat2 {
+    float v[4];
+};
+
+struct TileBounds {
+    int min_x;
+    int min_y;
+    int max_x;
+    int max_y;
+    int valid;
+};
+
+static constexpr float GSPLAT_GAUSSIAN_EXTEND = 3.33f;
+static constexpr float GSPLAT_MIN_COMPENSATION = 0.005f;
+static constexpr float GSPLAT_MAX_ALPHA = 0.99f;
+static constexpr int GSPLAT_ALPHA_COMPOSITE_MAX_CHANNELS = 64;
+static constexpr int GSPLAT_ALPHA_COMPOSITE_PREFIX_CHECKPOINT_INTERVAL = 32;
+static constexpr int GSPLAT_TILED_BWD_TILE_REDUCE_SIZE = 16;
+static constexpr int GSPLAT_TILED_BWD_TILE_REDUCE_PIXELS =
+    GSPLAT_TILED_BWD_TILE_REDUCE_SIZE * GSPLAT_TILED_BWD_TILE_REDUCE_SIZE;
+
+static __device__ float clampf(float x, float lo, float hi) {
+    return fminf(fmaxf(x, lo), hi);
+}
+
+static __device__ int clampi(int x, int lo, int hi) {
+    return x < lo ? lo : (x > hi ? hi : x);
+}
+
+static __device__ bool not_nan_float(float x) {
+    return x == x;
+}
+
+static __device__ TileBounds alpha_threshold_tile_bounds(
+    const float *means2d,
+    const int *radii,
+    const float *conics,
+    const float *opacities,
+    int idx,
+    int tile_size,
+    int tile_width,
+    int tile_height,
+    float alpha_threshold
+) {
+    TileBounds bounds;
+    bounds.min_x = 0;
+    bounds.min_y = 0;
+    bounds.max_x = 0;
+    bounds.max_y = 0;
+    bounds.valid = 0;
+    int rx = radii[idx * 2];
+    int ry = radii[idx * 2 + 1];
+    float opacity = opacities[idx];
+    bool valid = rx > 0 && ry > 0 && not_nan_float(opacity) && opacity > alpha_threshold;
+    if (!valid) {
+        return bounds;
+    }
+
+    float extent_x = static_cast<float>(rx);
+    float extent_y = static_cast<float>(ry);
+    float A = conics[idx * 3];
+    float B = conics[idx * 3 + 1];
+    float C = conics[idx * 3 + 2];
+    float disc = B * B - A * C;
+    float level = fminf(9.0f, 2.0f * logf(opacity / alpha_threshold));
+    float neg_level_over_disc = -level / disc;
+    float x_extent = sqrtf(neg_level_over_disc * C);
+    float y_extent = sqrtf(neg_level_over_disc * A);
+    bool ellipse_valid =
+        not_nan_float(A) &&
+        not_nan_float(B) &&
+        not_nan_float(C) &&
+        A > 0.0f &&
+        C > 0.0f &&
+        disc < -1.0e-20f &&
+        not_nan_float(level) &&
+        level > 0.0f &&
+        not_nan_float(x_extent) &&
+        not_nan_float(y_extent);
+    if (ellipse_valid) {
+        extent_x = x_extent;
+        extent_y = y_extent;
+    }
+
+    float inv_tile_size = 1.0f / static_cast<float>(tile_size);
+    float tile_x = means2d[idx * 2] * inv_tile_size;
+    float tile_y = means2d[idx * 2 + 1] * inv_tile_size;
+    float tile_radius_x = extent_x * inv_tile_size;
+    float tile_radius_y = extent_y * inv_tile_size;
+
+    bounds.min_x = clampi(static_cast<int>(floorf(tile_x - tile_radius_x)), 0, tile_width);
+    bounds.min_y = clampi(static_cast<int>(floorf(tile_y - tile_radius_y)), 0, tile_height);
+    bounds.max_x = clampi(static_cast<int>(ceilf(tile_x + tile_radius_x)), 0, tile_width);
+    bounds.max_y = clampi(static_cast<int>(ceilf(tile_y + tile_radius_y)), 0, tile_height);
+    bounds.valid = bounds.max_x > bounds.min_x && bounds.max_y > bounds.min_y ? 1 : 0;
+    return bounds;
+}
+
+static __device__ Mat3 make_rotmat(const float *quat) {
+    float w = quat[0];
+    float x = quat[1];
+    float y = quat[2];
+    float z = quat[3];
+    float inv_norm = rsqrtf(w * w + x * x + y * y + z * z);
+    w *= inv_norm;
+    x *= inv_norm;
+    y *= inv_norm;
+    z *= inv_norm;
+
+    float x2 = x * x;
+    float y2 = y * y;
+    float z2 = z * z;
+    float xy = x * y;
+    float xz = x * z;
+    float yz = y * z;
+    float wx = w * x;
+    float wy = w * y;
+    float wz = w * z;
+
+    Mat3 r;
+    r.v[0] = 1.0f - 2.0f * (y2 + z2);
+    r.v[1] = 2.0f * (xy - wz);
+    r.v[2] = 2.0f * (xz + wy);
+    r.v[3] = 2.0f * (xy + wz);
+    r.v[4] = 1.0f - 2.0f * (x2 + z2);
+    r.v[5] = 2.0f * (yz - wx);
+    r.v[6] = 2.0f * (xz - wy);
+    r.v[7] = 2.0f * (yz + wx);
+    r.v[8] = 1.0f - 2.0f * (x2 + y2);
+    return r;
+}
+
+static __device__ Vec3 transform_point_world_to_cam(const float *mean, const float *viewmat) {
+    Vec3 out;
+    out.v[0] = viewmat[0] * mean[0] + viewmat[1] * mean[1] + viewmat[2] * mean[2] + viewmat[3];
+    out.v[1] = viewmat[4] * mean[0] + viewmat[5] * mean[1] + viewmat[6] * mean[2] + viewmat[7];
+    out.v[2] = viewmat[8] * mean[0] + viewmat[9] * mean[1] + viewmat[10] * mean[2] + viewmat[11];
+    return out;
+}
+
+static __device__ Mat3 read_full_covar(const float *covar) {
+    Mat3 out;
+#pragma unroll
+    for (int i = 0; i < 9; ++i) {
+        out.v[i] = covar[i];
+    }
+    return out;
+}
+
+static __device__ Mat3 covar_from_rot_scale(const Mat3 &r, const float *scale) {
+    const float scale0_sq = scale[0] * scale[0];
+    const float scale1_sq = scale[1] * scale[1];
+    const float scale2_sq = scale[2] * scale[2];
+    Mat3 out;
+#pragma unroll
+    for (int row = 0; row < 3; ++row) {
+        const float r_row0 = r.v[row * 3];
+        const float r_row1 = r.v[row * 3 + 1];
+        const float r_row2 = r.v[row * 3 + 2];
+#pragma unroll
+        for (int col = 0; col < 3; ++col) {
+            float acc = r_row0 * scale0_sq * r.v[col * 3];
+            acc += r_row1 * scale1_sq * r.v[col * 3 + 1];
+            acc += r_row2 * scale2_sq * r.v[col * 3 + 2];
+            out.v[row * 3 + col] = acc;
+        }
+    }
+    return out;
+}
+
+static __device__ Mat3 transform_covar_world_to_cam(const Mat3 &covar, const float *viewmat) {
+    float r[9] = {
+        viewmat[0],
+        viewmat[1],
+        viewmat[2],
+        viewmat[4],
+        viewmat[5],
+        viewmat[6],
+        viewmat[8],
+        viewmat[9],
+        viewmat[10],
+    };
+    Mat3 out;
+#pragma unroll
+    for (int row = 0; row < 3; ++row) {
+#pragma unroll
+        for (int col = 0; col < 3; ++col) {
+            float acc = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 3; ++j) {
+#pragma unroll
+                for (int k = 0; k < 3; ++k) {
+                    acc += r[row * 3 + j] * covar.v[j * 3 + k] * r[col * 3 + k];
+                }
+            }
+            out.v[row * 3 + col] = acc;
+        }
+    }
+    return out;
+}
+
+static __device__ void project_pinhole(
+    const Vec3 &mean_c,
+    const Mat3 &covar_c,
+    const float *K,
+    int width,
+    int height,
+    Mat2 &covar2d,
+    float mean2d[2]
+) {
+    float x = mean_c.v[0];
+    float y = mean_c.v[1];
+    float z = mean_c.v[2];
+    float z2 = z * z;
+    float fx = K[0];
+    float fy = K[4];
+    float cx = K[2];
+    float cy = K[5];
+
+    float tan_fovx = 0.5f * static_cast<float>(width) / fx;
+    float tan_fovy = 0.5f * static_cast<float>(height) / fy;
+    float lim_x_pos = (static_cast<float>(width) - cx) / fx + 0.3f * tan_fovx;
+    float lim_x_neg = cx / fx + 0.3f * tan_fovx;
+    float lim_y_pos = (static_cast<float>(height) - cy) / fy + 0.3f * tan_fovy;
+    float lim_y_neg = cy / fy + 0.3f * tan_fovy;
+    float tx = z * clampf(x / z, -lim_x_neg, lim_x_pos);
+    float ty = z * clampf(y / z, -lim_y_neg, lim_y_pos);
+
+    float J[6] = {
+        fx / z,
+        0.0f,
+        -fx * tx / z2,
+        0.0f,
+        fy / z,
+        -fy * ty / z2,
+    };
+
+#pragma unroll
+    for (int row = 0; row < 2; ++row) {
+#pragma unroll
+        for (int col = 0; col < 2; ++col) {
+            float acc = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 3; ++j) {
+#pragma unroll
+                for (int k = 0; k < 3; ++k) {
+                    acc += J[row * 3 + j] * covar_c.v[j * 3 + k] * J[col * 3 + k];
+                }
+            }
+            covar2d.v[row * 2 + col] = acc;
+        }
+    }
+
+    mean2d[0] = (K[0] * x + K[1] * y + K[2] * z) / z;
+    mean2d[1] = (K[3] * x + K[4] * y + K[5] * z) / z;
+}
+
+static __device__ Mat3 zero_mat3() {
+    Mat3 out;
+#pragma unroll
+    for (int i = 0; i < 9; ++i) {
+        out.v[i] = 0.0f;
+    }
+    return out;
+}
+
+static __device__ Mat2 zero_mat2() {
+    Mat2 out;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        out.v[i] = 0.0f;
+    }
+    return out;
+}
+
+static __device__ Vec3 zero_vec3() {
+    Vec3 out;
+    out.v[0] = 0.0f;
+    out.v[1] = 0.0f;
+    out.v[2] = 0.0f;
+    return out;
+}
+
+static __device__ void inverse_mat2_vjp(const Mat2 &minv, const Mat2 &v_minv, Mat2 &v_m) {
+#pragma unroll
+    for (int row = 0; row < 2; ++row) {
+#pragma unroll
+        for (int col = 0; col < 2; ++col) {
+            float acc = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+#pragma unroll
+                for (int k = 0; k < 2; ++k) {
+                    acc += minv.v[row * 2 + j] * v_minv.v[j * 2 + k] * minv.v[k * 2 + col];
+                }
+            }
+            v_m.v[row * 2 + col] += -acc;
+        }
+    }
+}
+
+static __device__ void add_blur_vjp(
+    float eps2d,
+    const Mat2 &conic_blur,
+    float compensation,
+    float v_compensation,
+    Mat2 &v_covar
+) {
+    float det_conic_blur = conic_blur.v[0] * conic_blur.v[3] - conic_blur.v[1] * conic_blur.v[2];
+    float v_sqr_comp = v_compensation * 0.5f / (compensation + 1e-6f);
+    float one_minus_sqr_comp = 1.0f - compensation * compensation;
+    v_covar.v[0] += v_sqr_comp * (one_minus_sqr_comp * conic_blur.v[0] - eps2d * det_conic_blur);
+    v_covar.v[1] += v_sqr_comp * (one_minus_sqr_comp * conic_blur.v[1]);
+    v_covar.v[2] += v_sqr_comp * (one_minus_sqr_comp * conic_blur.v[2]);
+    v_covar.v[3] += v_sqr_comp * (one_minus_sqr_comp * conic_blur.v[3] - eps2d * det_conic_blur);
+}
+
+static __device__ void project_pinhole_vjp(
+    const Vec3 &mean_c,
+    const Mat3 &covar_c,
+    const float *K,
+    int width,
+    int height,
+    const Mat2 &v_covar2d,
+    const float v_mean2d[2],
+    Vec3 &v_mean_c,
+    Mat3 &v_covar_c
+) {
+    float x = mean_c.v[0];
+    float y = mean_c.v[1];
+    float z = mean_c.v[2];
+    float fx = K[0];
+    float fy = K[4];
+    float cx = K[2];
+    float cy = K[5];
+
+    float tan_fovx = 0.5f * static_cast<float>(width) / fx;
+    float tan_fovy = 0.5f * static_cast<float>(height) / fy;
+    float lim_x_pos = (static_cast<float>(width) - cx) / fx + 0.3f * tan_fovx;
+    float lim_x_neg = cx / fx + 0.3f * tan_fovx;
+    float lim_y_pos = (static_cast<float>(height) - cy) / fy + 0.3f * tan_fovy;
+    float lim_y_neg = cy / fy + 0.3f * tan_fovy;
+
+    float rz = 1.0f / z;
+    float rz2 = rz * rz;
+    float rz3 = rz2 * rz;
+    float tx = z * clampf(x * rz, -lim_x_neg, lim_x_pos);
+    float ty = z * clampf(y * rz, -lim_y_neg, lim_y_pos);
+
+    float J[6] = {
+        fx * rz,
+        0.0f,
+        -fx * tx * rz2,
+        0.0f,
+        fy * rz,
+        -fy * ty * rz2,
+    };
+
+#pragma unroll
+    for (int row = 0; row < 3; ++row) {
+#pragma unroll
+        for (int col = 0; col < 3; ++col) {
+            float acc = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+#pragma unroll
+                for (int k = 0; k < 2; ++k) {
+                    acc += J[j * 3 + row] * v_covar2d.v[j * 2 + k] * J[k * 3 + col];
+                }
+            }
+            v_covar_c.v[row * 3 + col] += acc;
+        }
+    }
+
+    v_mean_c.v[0] += fx * rz * v_mean2d[0];
+    v_mean_c.v[1] += fy * rz * v_mean2d[1];
+    v_mean_c.v[2] += -(fx * x * v_mean2d[0] + fy * y * v_mean2d[1]) * rz2;
+
+    float v_J[6];
+#pragma unroll
+    for (int row = 0; row < 2; ++row) {
+#pragma unroll
+        for (int col = 0; col < 3; ++col) {
+            float acc = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+#pragma unroll
+                for (int k = 0; k < 3; ++k) {
+                    acc += v_covar2d.v[row * 2 + j] * J[j * 3 + k] * covar_c.v[col * 3 + k];
+                    acc += v_covar2d.v[j * 2 + row] * J[j * 3 + k] * covar_c.v[k * 3 + col];
+                }
+            }
+            v_J[row * 3 + col] = acc;
+        }
+    }
+
+    if (x * rz <= lim_x_pos && x * rz >= -lim_x_neg) {
+        v_mean_c.v[0] += -fx * rz2 * v_J[2];
+    } else {
+        v_mean_c.v[2] += -fx * rz3 * v_J[2] * tx;
+    }
+    if (y * rz <= lim_y_pos && y * rz >= -lim_y_neg) {
+        v_mean_c.v[1] += -fy * rz2 * v_J[5];
+    } else {
+        v_mean_c.v[2] += -fy * rz3 * v_J[5] * ty;
+    }
+    v_mean_c.v[2] +=
+        -fx * rz2 * v_J[0] - fy * rz2 * v_J[4] +
+        2.0f * fx * tx * rz3 * v_J[2] + 2.0f * fy * ty * rz3 * v_J[5];
+}
+
+static __device__ void transform_point_world_to_cam_vjp(
+    const float *mean,
+    const float *viewmat,
+    const Vec3 &v_mean_c,
+    Vec3 &v_mean,
+    Mat3 &v_r,
+    Vec3 &v_t,
+    bool need_v_mean,
+    bool need_v_viewmat
+) {
+    float r[9];
+    if (need_v_mean) {
+        r[0] = viewmat[0];
+        r[1] = viewmat[1];
+        r[2] = viewmat[2];
+        r[3] = viewmat[4];
+        r[4] = viewmat[5];
+        r[5] = viewmat[6];
+        r[6] = viewmat[8];
+        r[7] = viewmat[9];
+        r[8] = viewmat[10];
+    }
+#pragma unroll
+    for (int row = 0; row < 3; ++row) {
+        if (need_v_viewmat) {
+            v_t.v[row] += v_mean_c.v[row];
+        }
+#pragma unroll
+        for (int col = 0; col < 3; ++col) {
+            if (need_v_viewmat) {
+                v_r.v[row * 3 + col] += v_mean_c.v[row] * mean[col];
+            }
+            if (need_v_mean) {
+                v_mean.v[col] += r[row * 3 + col] * v_mean_c.v[row];
+            }
+        }
+    }
+}
+
+static __device__ void transform_covar_world_to_cam_vjp(
+    const Mat3 &covar,
+    const float *viewmat,
+    const Mat3 &v_covar_c,
+    Mat3 &v_covar,
+    Mat3 &v_r,
+    bool need_v_covar,
+    bool need_v_viewmat
+) {
+    float r[9] = {
+        viewmat[0],
+        viewmat[1],
+        viewmat[2],
+        viewmat[4],
+        viewmat[5],
+        viewmat[6],
+        viewmat[8],
+        viewmat[9],
+        viewmat[10],
+    };
+    if (need_v_covar) {
+#pragma unroll
+        for (int row = 0; row < 3; ++row) {
+#pragma unroll
+            for (int col = 0; col < 3; ++col) {
+                float acc = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 3; ++j) {
+#pragma unroll
+                    for (int k = 0; k < 3; ++k) {
+                        acc += r[j * 3 + row] * v_covar_c.v[j * 3 + k] * r[k * 3 + col];
+                    }
+                }
+                v_covar.v[row * 3 + col] += acc;
+            }
+        }
+    }
+
+    if (!need_v_viewmat) {
+        return;
+    }
+#pragma unroll
+    for (int row = 0; row < 3; ++row) {
+#pragma unroll
+        for (int col = 0; col < 3; ++col) {
+            float acc = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 3; ++j) {
+#pragma unroll
+                for (int k = 0; k < 3; ++k) {
+                    acc += v_covar_c.v[row * 3 + j] * r[j * 3 + k] * covar.v[col * 3 + k];
+                    acc += v_covar_c.v[j * 3 + row] * r[j * 3 + k] * covar.v[k * 3 + col];
+                }
+            }
+            v_r.v[row * 3 + col] += acc;
+        }
+    }
+}
+
+static __device__ void write_symmetric(float *out, bool triu, const float m[9]) {
+    if (triu) {
+        out[0] = m[0];
+        out[1] = m[1];
+        out[2] = m[2];
+        out[3] = m[4];
+        out[4] = m[5];
+        out[5] = m[8];
+    } else {
+#pragma unroll
+        for (int i = 0; i < 9; ++i) {
+            out[i] = m[i];
+        }
+    }
+}
+
+static __device__ Mat3 read_grad_mat(const float *grad, bool triu) {
+    Mat3 out;
+    if (triu) {
+        out.v[0] = grad[0];
+        out.v[1] = 0.5f * grad[1];
+        out.v[2] = 0.5f * grad[2];
+        out.v[3] = 0.5f * grad[1];
+        out.v[4] = grad[3];
+        out.v[5] = 0.5f * grad[4];
+        out.v[6] = 0.5f * grad[2];
+        out.v[7] = 0.5f * grad[4];
+        out.v[8] = grad[5];
+    } else {
+#pragma unroll
+        for (int i = 0; i < 9; ++i) {
+            out.v[i] = grad[i];
+        }
+    }
+    return out;
+}
+
+static __device__ void quat_to_rotmat_vjp(const float *quat, const Mat3 &v_r, float v_quat[4]) {
+    float w = quat[0];
+    float x = quat[1];
+    float y = quat[2];
+    float z = quat[3];
+    float inv_norm = rsqrtf(w * w + x * x + y * y + z * z);
+    w *= inv_norm;
+    x *= inv_norm;
+    y *= inv_norm;
+    z *= inv_norm;
+
+    float v_quat_n[4];
+    v_quat_n[0] =
+        2.0f * (x * (v_r.v[7] - v_r.v[5]) + y * (v_r.v[2] - v_r.v[6]) +
+                z * (v_r.v[3] - v_r.v[1]));
+    v_quat_n[1] =
+        2.0f *
+        (-2.0f * x * (v_r.v[4] + v_r.v[8]) + y * (v_r.v[1] + v_r.v[3]) +
+         z * (v_r.v[2] + v_r.v[6]) + w * (v_r.v[7] - v_r.v[5]));
+    v_quat_n[2] =
+        2.0f * (x * (v_r.v[1] + v_r.v[3]) - 2.0f * y * (v_r.v[0] + v_r.v[8]) +
+                z * (v_r.v[5] + v_r.v[7]) + w * (v_r.v[2] - v_r.v[6]));
+    v_quat_n[3] =
+        2.0f * (x * (v_r.v[2] + v_r.v[6]) + y * (v_r.v[5] + v_r.v[7]) -
+                2.0f * z * (v_r.v[0] + v_r.v[4]) + w * (v_r.v[3] - v_r.v[1]));
+
+    float dot = v_quat_n[0] * w + v_quat_n[1] * x + v_quat_n[2] * y + v_quat_n[3] * z;
+    v_quat[0] += (v_quat_n[0] - dot * w) * inv_norm;
+    v_quat[1] += (v_quat_n[1] - dot * x) * inv_norm;
+    v_quat[2] += (v_quat_n[2] - dot * y) * inv_norm;
+    v_quat[3] += (v_quat_n[3] - dot * z) * inv_norm;
+}
+
+static __device__ void add_covar_vjp(
+    const float *quat,
+    const float *scale,
+    const Mat3 &r,
+    const Mat3 &v_covar,
+    float v_quat[4],
+    float v_scale[3]
+) {
+    Mat3 m;
+#pragma unroll
+    for (int row = 0; row < 3; ++row) {
+#pragma unroll
+        for (int col = 0; col < 3; ++col) {
+            m.v[row * 3 + col] = r.v[row * 3 + col] * scale[col];
+        }
+    }
+
+    Mat3 v_m;
+#pragma unroll
+    for (int row = 0; row < 3; ++row) {
+#pragma unroll
+        for (int col = 0; col < 3; ++col) {
+            float acc = 0.0f;
+#pragma unroll
+            for (int k = 0; k < 3; ++k) {
+                acc += (v_covar.v[row * 3 + k] + v_covar.v[k * 3 + row]) * m.v[k * 3 + col];
+            }
+            v_m.v[row * 3 + col] = acc;
+        }
+    }
+
+    Mat3 v_r;
+#pragma unroll
+    for (int row = 0; row < 3; ++row) {
+#pragma unroll
+        for (int col = 0; col < 3; ++col) {
+            v_r.v[row * 3 + col] = v_m.v[row * 3 + col] * scale[col];
+        }
+    }
+    quat_to_rotmat_vjp(quat, v_r, v_quat);
+
+#pragma unroll
+    for (int col = 0; col < 3; ++col) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int row = 0; row < 3; ++row) {
+            acc += r.v[row * 3 + col] * v_m.v[row * 3 + col];
+        }
+        v_scale[col] += acc;
+    }
+}
+
+static __device__ void add_preci_vjp(
+    const float *quat,
+    const float *scale,
+    const Mat3 &r,
+    const Mat3 &v_preci,
+    float v_quat[4],
+    float v_scale[3]
+) {
+    float inv_scale[3] = {1.0f / scale[0], 1.0f / scale[1], 1.0f / scale[2]};
+    Mat3 m;
+#pragma unroll
+    for (int row = 0; row < 3; ++row) {
+#pragma unroll
+        for (int col = 0; col < 3; ++col) {
+            m.v[row * 3 + col] = r.v[row * 3 + col] * inv_scale[col];
+        }
+    }
+
+    Mat3 v_m;
+#pragma unroll
+    for (int row = 0; row < 3; ++row) {
+#pragma unroll
+        for (int col = 0; col < 3; ++col) {
+            float acc = 0.0f;
+#pragma unroll
+            for (int k = 0; k < 3; ++k) {
+                acc += (v_preci.v[row * 3 + k] + v_preci.v[k * 3 + row]) * m.v[k * 3 + col];
+            }
+            v_m.v[row * 3 + col] = acc;
+        }
+    }
+
+    Mat3 v_r;
+#pragma unroll
+    for (int row = 0; row < 3; ++row) {
+#pragma unroll
+        for (int col = 0; col < 3; ++col) {
+            v_r.v[row * 3 + col] = v_m.v[row * 3 + col] * inv_scale[col];
+        }
+    }
+    quat_to_rotmat_vjp(quat, v_r, v_quat);
+
+#pragma unroll
+    for (int col = 0; col < 3; ++col) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int row = 0; row < 3; ++row) {
+            acc += r.v[row * 3 + col] * v_m.v[row * 3 + col];
+        }
+        v_scale[col] += -inv_scale[col] * inv_scale[col] * acc;
+    }
+}
+
+static __device__ void sh_dir_grad_to_input(
+    float x,
+    float y,
+    float z,
+    float inv_norm,
+    float v_x,
+    float v_y,
+    float v_z,
+    float *v_dir
+) {
+    float dot = v_x * x + v_y * y + v_z * z;
+    atomicAdd(v_dir, (v_x - dot * x) * inv_norm);
+    atomicAdd(v_dir + 1, (v_y - dot * y) * inv_norm);
+    atomicAdd(v_dir + 2, (v_z - dot * z) * inv_norm);
+}
+
+static __device__ float sh_coeffs_to_color(
+    int degree,
+    int channel,
+    const float *dir,
+    const float *coeffs
+) {
+    float result = 0.2820947917738781f * coeffs[channel];
+    if (degree >= 1) {
+        float inv_norm = rsqrtf(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+        float x = dir[0] * inv_norm;
+        float y = dir[1] * inv_norm;
+        float z = dir[2] * inv_norm;
+
+        result +=
+            0.48860251190292f * (-y * coeffs[1 * 3 + channel] +
+                                 z * coeffs[2 * 3 + channel] -
+                                 x * coeffs[3 * 3 + channel]);
+        if (degree >= 2) {
+            float z2 = z * z;
+            float fTmp0B = -1.092548430592079f * z;
+            float fC1 = x * x - y * y;
+            float fS1 = 2.0f * x * y;
+            float pSH6 = 0.9461746957575601f * z2 - 0.3153915652525201f;
+            float pSH7 = fTmp0B * x;
+            float pSH5 = fTmp0B * y;
+            float pSH8 = 0.5462742152960395f * fC1;
+            float pSH4 = 0.5462742152960395f * fS1;
+
+            result += pSH4 * coeffs[4 * 3 + channel] +
+                      pSH5 * coeffs[5 * 3 + channel] +
+                      pSH6 * coeffs[6 * 3 + channel] +
+                      pSH7 * coeffs[7 * 3 + channel] +
+                      pSH8 * coeffs[8 * 3 + channel];
+            if (degree >= 3) {
+                float fTmp0C = -2.285228997322329f * z2 + 0.4570457994644658f;
+                float fTmp1B = 1.445305721320277f * z;
+                float fC2 = x * fC1 - y * fS1;
+                float fS2 = x * fS1 + y * fC1;
+                float pSH12 = z * (1.865881662950577f * z2 - 1.119528997770346f);
+                float pSH13 = fTmp0C * x;
+                float pSH11 = fTmp0C * y;
+                float pSH14 = fTmp1B * fC1;
+                float pSH10 = fTmp1B * fS1;
+                float pSH15 = -0.5900435899266435f * fC2;
+                float pSH9 = -0.5900435899266435f * fS2;
+
+                result += pSH9 * coeffs[9 * 3 + channel] +
+                          pSH10 * coeffs[10 * 3 + channel] +
+                          pSH11 * coeffs[11 * 3 + channel] +
+                          pSH12 * coeffs[12 * 3 + channel] +
+                          pSH13 * coeffs[13 * 3 + channel] +
+                          pSH14 * coeffs[14 * 3 + channel] +
+                          pSH15 * coeffs[15 * 3 + channel];
+                if (degree >= 4) {
+                    float fTmp0D =
+                        z * (-4.683325804901025f * z2 + 2.007139630671868f);
+                    float fTmp1C = 3.31161143515146f * z2 - 0.47308734787878f;
+                    float fTmp2B = -1.770130769779931f * z;
+                    float fC3 = x * fC2 - y * fS2;
+                    float fS3 = x * fS2 + y * fC2;
+                    float pSH20 =
+                        1.984313483298443f * z * pSH12 -
+                        1.006230589874905f * pSH6;
+                    float pSH21 = fTmp0D * x;
+                    float pSH19 = fTmp0D * y;
+                    float pSH22 = fTmp1C * fC1;
+                    float pSH18 = fTmp1C * fS1;
+                    float pSH23 = fTmp2B * fC2;
+                    float pSH17 = fTmp2B * fS2;
+                    float pSH24 = 0.6258357354491763f * fC3;
+                    float pSH16 = 0.6258357354491763f * fS3;
+
+                    result += pSH16 * coeffs[16 * 3 + channel] +
+                              pSH17 * coeffs[17 * 3 + channel] +
+                              pSH18 * coeffs[18 * 3 + channel] +
+                              pSH19 * coeffs[19 * 3 + channel] +
+                              pSH20 * coeffs[20 * 3 + channel] +
+                              pSH21 * coeffs[21 * 3 + channel] +
+                              pSH22 * coeffs[22 * 3 + channel] +
+                              pSH23 * coeffs[23 * 3 + channel] +
+                              pSH24 * coeffs[24 * 3 + channel];
+                }
+            }
+        }
+    }
+    return result;
+}
+
+static __device__ void sh_coeffs_to_color_vjp(
+    int degree,
+    int channel,
+    const float *dir,
+    const float *coeffs,
+    float v_color,
+    float *v_coeffs,
+    float *v_dir
+) {
+    v_coeffs[channel] = 0.2820947917738781f * v_color;
+    if (degree < 1) {
+        return;
+    }
+
+    float inv_norm = rsqrtf(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+    float x = dir[0] * inv_norm;
+    float y = dir[1] * inv_norm;
+    float z = dir[2] * inv_norm;
+    float v_x = 0.0f;
+    float v_y = 0.0f;
+    float v_z = 0.0f;
+
+    v_coeffs[1 * 3 + channel] = -0.48860251190292f * y * v_color;
+    v_coeffs[2 * 3 + channel] = 0.48860251190292f * z * v_color;
+    v_coeffs[3 * 3 + channel] = -0.48860251190292f * x * v_color;
+
+    if (v_dir != nullptr) {
+        v_x += -0.48860251190292f * coeffs[3 * 3 + channel] * v_color;
+        v_y += -0.48860251190292f * coeffs[1 * 3 + channel] * v_color;
+        v_z += 0.48860251190292f * coeffs[2 * 3 + channel] * v_color;
+    }
+    if (degree < 2) {
+        if (v_dir != nullptr) {
+            sh_dir_grad_to_input(x, y, z, inv_norm, v_x, v_y, v_z, v_dir);
+        }
+        return;
+    }
+
+    float z2 = z * z;
+    float fTmp0B = -1.092548430592079f * z;
+    float fC1 = x * x - y * y;
+    float fS1 = 2.0f * x * y;
+    float pSH6 = 0.9461746957575601f * z2 - 0.3153915652525201f;
+    float pSH7 = fTmp0B * x;
+    float pSH5 = fTmp0B * y;
+    float pSH8 = 0.5462742152960395f * fC1;
+    float pSH4 = 0.5462742152960395f * fS1;
+    v_coeffs[4 * 3 + channel] = pSH4 * v_color;
+    v_coeffs[5 * 3 + channel] = pSH5 * v_color;
+    v_coeffs[6 * 3 + channel] = pSH6 * v_color;
+    v_coeffs[7 * 3 + channel] = pSH7 * v_color;
+    v_coeffs[8 * 3 + channel] = pSH8 * v_color;
+
+    float fTmp0B_z = -1.092548430592079f;
+    float fC1_x = 2.0f * x;
+    float fC1_y = -2.0f * y;
+    float fS1_x = 2.0f * y;
+    float fS1_y = 2.0f * x;
+    float pSH6_z = 2.0f * 0.9461746957575601f * z;
+    float pSH7_x = fTmp0B;
+    float pSH7_z = fTmp0B_z * x;
+    float pSH5_y = fTmp0B;
+    float pSH5_z = fTmp0B_z * y;
+    float pSH8_x = 0.5462742152960395f * fC1_x;
+    float pSH8_y = 0.5462742152960395f * fC1_y;
+    float pSH4_x = 0.5462742152960395f * fS1_x;
+    float pSH4_y = 0.5462742152960395f * fS1_y;
+    if (v_dir != nullptr) {
+        v_x += v_color *
+               (pSH4_x * coeffs[4 * 3 + channel] +
+                pSH8_x * coeffs[8 * 3 + channel] +
+                pSH7_x * coeffs[7 * 3 + channel]);
+        v_y += v_color *
+               (pSH4_y * coeffs[4 * 3 + channel] +
+                pSH8_y * coeffs[8 * 3 + channel] +
+                pSH5_y * coeffs[5 * 3 + channel]);
+        v_z += v_color *
+               (pSH6_z * coeffs[6 * 3 + channel] +
+                pSH7_z * coeffs[7 * 3 + channel] +
+                pSH5_z * coeffs[5 * 3 + channel]);
+    }
+    if (degree < 3) {
+        if (v_dir != nullptr) {
+            sh_dir_grad_to_input(x, y, z, inv_norm, v_x, v_y, v_z, v_dir);
+        }
+        return;
+    }
+
+    float fTmp0C = -2.285228997322329f * z2 + 0.4570457994644658f;
+    float fTmp1B = 1.445305721320277f * z;
+    float fC2 = x * fC1 - y * fS1;
+    float fS2 = x * fS1 + y * fC1;
+    float pSH12 = z * (1.865881662950577f * z2 - 1.119528997770346f);
+    float pSH13 = fTmp0C * x;
+    float pSH11 = fTmp0C * y;
+    float pSH14 = fTmp1B * fC1;
+    float pSH10 = fTmp1B * fS1;
+    float pSH15 = -0.5900435899266435f * fC2;
+    float pSH9 = -0.5900435899266435f * fS2;
+    v_coeffs[9 * 3 + channel] = pSH9 * v_color;
+    v_coeffs[10 * 3 + channel] = pSH10 * v_color;
+    v_coeffs[11 * 3 + channel] = pSH11 * v_color;
+    v_coeffs[12 * 3 + channel] = pSH12 * v_color;
+    v_coeffs[13 * 3 + channel] = pSH13 * v_color;
+    v_coeffs[14 * 3 + channel] = pSH14 * v_color;
+    v_coeffs[15 * 3 + channel] = pSH15 * v_color;
+
+    float fTmp0C_z = -2.285228997322329f * 2.0f * z;
+    float fTmp1B_z = 1.445305721320277f;
+    float fC2_x = fC1 + x * fC1_x - y * fS1_x;
+    float fC2_y = x * fC1_y - fS1 - y * fS1_y;
+    float fS2_x = fS1 + x * fS1_x + y * fC1_x;
+    float fS2_y = x * fS1_y + fC1 + y * fC1_y;
+    float pSH12_z = 3.0f * 1.865881662950577f * z2 - 1.119528997770346f;
+    float pSH13_x = fTmp0C;
+    float pSH13_z = fTmp0C_z * x;
+    float pSH11_y = fTmp0C;
+    float pSH11_z = fTmp0C_z * y;
+    float pSH14_x = fTmp1B * fC1_x;
+    float pSH14_y = fTmp1B * fC1_y;
+    float pSH14_z = fTmp1B_z * fC1;
+    float pSH10_x = fTmp1B * fS1_x;
+    float pSH10_y = fTmp1B * fS1_y;
+    float pSH10_z = fTmp1B_z * fS1;
+    float pSH15_x = -0.5900435899266435f * fC2_x;
+    float pSH15_y = -0.5900435899266435f * fC2_y;
+    float pSH9_x = -0.5900435899266435f * fS2_x;
+    float pSH9_y = -0.5900435899266435f * fS2_y;
+    if (v_dir != nullptr) {
+        v_x += v_color *
+               (pSH9_x * coeffs[9 * 3 + channel] +
+                pSH15_x * coeffs[15 * 3 + channel] +
+                pSH10_x * coeffs[10 * 3 + channel] +
+                pSH14_x * coeffs[14 * 3 + channel] +
+                pSH13_x * coeffs[13 * 3 + channel]);
+        v_y += v_color *
+               (pSH9_y * coeffs[9 * 3 + channel] +
+                pSH15_y * coeffs[15 * 3 + channel] +
+                pSH10_y * coeffs[10 * 3 + channel] +
+                pSH14_y * coeffs[14 * 3 + channel] +
+                pSH11_y * coeffs[11 * 3 + channel]);
+        v_z += v_color *
+               (pSH12_z * coeffs[12 * 3 + channel] +
+                pSH13_z * coeffs[13 * 3 + channel] +
+                pSH11_z * coeffs[11 * 3 + channel] +
+                pSH14_z * coeffs[14 * 3 + channel] +
+                pSH10_z * coeffs[10 * 3 + channel]);
+    }
+    if (degree < 4) {
+        if (v_dir != nullptr) {
+            sh_dir_grad_to_input(x, y, z, inv_norm, v_x, v_y, v_z, v_dir);
+        }
+        return;
+    }
+
+    float fTmp0D = z * (-4.683325804901025f * z2 + 2.007139630671868f);
+    float fTmp1C = 3.31161143515146f * z2 - 0.47308734787878f;
+    float fTmp2B = -1.770130769779931f * z;
+    float fC3 = x * fC2 - y * fS2;
+    float fS3 = x * fS2 + y * fC2;
+    float pSH20 = 1.984313483298443f * z * pSH12 - 1.006230589874905f * pSH6;
+    float pSH21 = fTmp0D * x;
+    float pSH19 = fTmp0D * y;
+    float pSH22 = fTmp1C * fC1;
+    float pSH18 = fTmp1C * fS1;
+    float pSH23 = fTmp2B * fC2;
+    float pSH17 = fTmp2B * fS2;
+    float pSH24 = 0.6258357354491763f * fC3;
+    float pSH16 = 0.6258357354491763f * fS3;
+    v_coeffs[16 * 3 + channel] = pSH16 * v_color;
+    v_coeffs[17 * 3 + channel] = pSH17 * v_color;
+    v_coeffs[18 * 3 + channel] = pSH18 * v_color;
+    v_coeffs[19 * 3 + channel] = pSH19 * v_color;
+    v_coeffs[20 * 3 + channel] = pSH20 * v_color;
+    v_coeffs[21 * 3 + channel] = pSH21 * v_color;
+    v_coeffs[22 * 3 + channel] = pSH22 * v_color;
+    v_coeffs[23 * 3 + channel] = pSH23 * v_color;
+    v_coeffs[24 * 3 + channel] = pSH24 * v_color;
+
+    if (v_dir != nullptr) {
+        float fTmp0D_z = 3.0f * -4.683325804901025f * z2 + 2.007139630671868f;
+        float fTmp1C_z = 2.0f * 3.31161143515146f * z;
+        float fTmp2B_z = -1.770130769779931f;
+        float fC3_x = fC2 + x * fC2_x - y * fS2_x;
+        float fC3_y = x * fC2_y - fS2 - y * fS2_y;
+        float fS3_x = fS2 + y * fC2_x + x * fS2_x;
+        float fS3_y = x * fS2_y + fC2 + y * fC2_y;
+        float pSH20_z =
+            1.984313483298443f * (pSH12 + z * pSH12_z) -
+            1.006230589874905f * pSH6_z;
+        float pSH21_x = fTmp0D;
+        float pSH21_z = fTmp0D_z * x;
+        float pSH19_y = fTmp0D;
+        float pSH19_z = fTmp0D_z * y;
+        float pSH22_x = fTmp1C * fC1_x;
+        float pSH22_y = fTmp1C * fC1_y;
+        float pSH22_z = fTmp1C_z * fC1;
+        float pSH18_x = fTmp1C * fS1_x;
+        float pSH18_y = fTmp1C * fS1_y;
+        float pSH18_z = fTmp1C_z * fS1;
+        float pSH23_x = fTmp2B * fC2_x;
+        float pSH23_y = fTmp2B * fC2_y;
+        float pSH23_z = fTmp2B_z * fC2;
+        float pSH17_x = fTmp2B * fS2_x;
+        float pSH17_y = fTmp2B * fS2_y;
+        float pSH17_z = fTmp2B_z * fS2;
+        float pSH24_x = 0.6258357354491763f * fC3_x;
+        float pSH24_y = 0.6258357354491763f * fC3_y;
+        float pSH16_x = 0.6258357354491763f * fS3_x;
+        float pSH16_y = 0.6258357354491763f * fS3_y;
+
+        v_x += v_color *
+               (pSH16_x * coeffs[16 * 3 + channel] +
+                pSH24_x * coeffs[24 * 3 + channel] +
+                pSH17_x * coeffs[17 * 3 + channel] +
+                pSH23_x * coeffs[23 * 3 + channel] +
+                pSH18_x * coeffs[18 * 3 + channel] +
+                pSH22_x * coeffs[22 * 3 + channel] +
+                pSH21_x * coeffs[21 * 3 + channel]);
+        v_y += v_color *
+               (pSH16_y * coeffs[16 * 3 + channel] +
+                pSH24_y * coeffs[24 * 3 + channel] +
+                pSH17_y * coeffs[17 * 3 + channel] +
+                pSH23_y * coeffs[23 * 3 + channel] +
+                pSH18_y * coeffs[18 * 3 + channel] +
+                pSH22_y * coeffs[22 * 3 + channel] +
+                pSH19_y * coeffs[19 * 3 + channel]);
+        v_z += v_color *
+               (pSH20_z * coeffs[20 * 3 + channel] +
+                pSH21_z * coeffs[21 * 3 + channel] +
+                pSH19_z * coeffs[19 * 3 + channel] +
+                pSH22_z * coeffs[22 * 3 + channel] +
+                pSH18_z * coeffs[18 * 3 + channel] +
+                pSH23_z * coeffs[23 * 3 + channel] +
+                pSH17_z * coeffs[17 * 3 + channel]);
+        sh_dir_grad_to_input(x, y, z, inv_norm, v_x, v_y, v_z, v_dir);
+    }
+}
+
+extern "C" __global__ void gsplat_spherical_harmonics_fwd_kernel(
+    const float *dirs,
+    const float *coeffs,
+    int degree,
+    int N,
+    int K,
+    float *colors
+) {
+    int idx = block_idx.x * block_dim.x + thread_idx.x;
+    int total = N * 3;
+    if (idx >= total) {
+        return;
+    }
+    int elem_id = idx / 3;
+    int channel = idx - elem_id * 3;
+    colors[idx] = sh_coeffs_to_color(
+        degree,
+        channel,
+        dirs + elem_id * 3,
+        coeffs + elem_id * K * 3
+    );
+}
+
+extern "C" suError_t gsplat_spherical_harmonics_fwd_launch(
+    const float *dirs,
+    const float *coeffs,
+    int degree,
+    int N,
+    int K,
+    float *colors,
+    suStream_t stream
+) {
+    int threads = 256;
+    int total = N * 3;
+    int blocks = (total + threads - 1) / threads;
+    suLaunchKernel(
+        gsplat_spherical_harmonics_fwd_kernel,
+        dim3(blocks),
+        dim3(threads),
+        0,
+        stream,
+        dirs,
+        coeffs,
+        degree,
+        N,
+        K,
+        colors
+    );
+    return suPeekAtLastError();
+}
+
+extern "C" __global__ void gsplat_spherical_harmonics_bwd_kernel(
+    const float *dirs,
+    const float *coeffs,
+    const float *v_colors,
+    int degree,
+    int N,
+    int K,
+    float *v_dirs,
+    float *v_coeffs
+) {
+    int idx = block_idx.x * block_dim.x + thread_idx.x;
+    int total = N * 3;
+    if (idx >= total) {
+        return;
+    }
+    int elem_id = idx / 3;
+    int channel = idx - elem_id * 3;
+    sh_coeffs_to_color_vjp(
+        degree,
+        channel,
+        dirs + elem_id * 3,
+        coeffs + elem_id * K * 3,
+        v_colors[idx],
+        v_coeffs + elem_id * K * 3,
+        v_dirs == nullptr ? nullptr : v_dirs + elem_id * 3
+    );
+}
+
+extern "C" suError_t gsplat_spherical_harmonics_bwd_launch(
+    const float *dirs,
+    const float *coeffs,
+    const float *v_colors,
+    int degree,
+    int N,
+    int K,
+    float *v_dirs,
+    float *v_coeffs,
+    suStream_t stream
+) {
+    int threads = 256;
+    int total = N * 3;
+    int blocks = (total + threads - 1) / threads;
+    suLaunchKernel(
+        gsplat_spherical_harmonics_bwd_kernel,
+        dim3(blocks),
+        dim3(threads),
+        0,
+        stream,
+        dirs,
+        coeffs,
+        v_colors,
+        degree,
+        N,
+        K,
+        v_dirs,
+        v_coeffs
+    );
+    return suPeekAtLastError();
+}
+
+extern "C" __global__ void gsplat_quat_scale_to_covar_preci_fwd_kernel(
+    const float *quats,
+    const float *scales,
+    int n,
+    bool triu,
+    float *covars,
+    float *precis
+) {
+    int idx = block_idx.x * block_dim.x + thread_idx.x;
+    if (idx >= n) {
+        return;
+    }
+
+    const float *q = quats + idx * 4;
+    const float *s = scales + idx * 3;
+    Mat3 r = make_rotmat(q);
+
+    if (covars != nullptr) {
+        float m[9];
+#pragma unroll
+        for (int row = 0; row < 3; ++row) {
+#pragma unroll
+            for (int col = 0; col < 3; ++col) {
+                float acc = 0.0f;
+#pragma unroll
+                for (int k = 0; k < 3; ++k) {
+                    acc += r.v[row * 3 + k] * s[k] * s[k] * r.v[col * 3 + k];
+                }
+                m[row * 3 + col] = acc;
+            }
+        }
+        write_symmetric(covars + idx * (triu ? 6 : 9), triu, m);
+    }
+
+    if (precis != nullptr) {
+        float m[9];
+#pragma unroll
+        for (int row = 0; row < 3; ++row) {
+#pragma unroll
+            for (int col = 0; col < 3; ++col) {
+                float acc = 0.0f;
+#pragma unroll
+                for (int k = 0; k < 3; ++k) {
+                    float inv = 1.0f / s[k];
+                    acc += r.v[row * 3 + k] * inv * inv * r.v[col * 3 + k];
+                }
+                m[row * 3 + col] = acc;
+            }
+        }
+        write_symmetric(precis + idx * (triu ? 6 : 9), triu, m);
+    }
+}
+
+extern "C" __global__ void gsplat_quat_scale_to_covar_preci_bwd_kernel(
+    const float *quats,
+    const float *scales,
+    int n,
+    bool triu,
+    const float *v_covars,
+    const float *v_precis,
+    float *v_quats,
+    float *v_scales
+) {
+    int idx = block_idx.x * block_dim.x + thread_idx.x;
+    if (idx >= n) {
+        return;
+    }
+
+    const float *q = quats + idx * 4;
+    const float *s = scales + idx * 3;
+    Mat3 r = make_rotmat(q);
+    float vq[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float vs[3] = {0.0f, 0.0f, 0.0f};
+
+    if (v_covars != nullptr) {
+        Mat3 grad = read_grad_mat(v_covars + idx * (triu ? 6 : 9), triu);
+        add_covar_vjp(q, s, r, grad, vq, vs);
+    }
+    if (v_precis != nullptr) {
+        Mat3 grad = read_grad_mat(v_precis + idx * (triu ? 6 : 9), triu);
+        add_preci_vjp(q, s, r, grad, vq, vs);
+    }
+
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        v_quats[idx * 4 + k] = vq[k];
+    }
+#pragma unroll
+    for (int k = 0; k < 3; ++k) {
+        v_scales[idx * 3 + k] = vs[k];
+    }
+}
+
+extern "C" suError_t gsplat_quat_scale_to_covar_preci_fwd_launch(
+    const float *quats,
+    const float *scales,
+    int n,
+    bool triu,
+    float *covars,
+    float *precis,
+    suStream_t stream
+) {
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    suLaunchKernel(
+        gsplat_quat_scale_to_covar_preci_fwd_kernel,
+        dim3(blocks),
+        dim3(threads),
+        0,
+        stream,
+        quats,
+        scales,
+        n,
+        triu,
+        covars,
+        precis
+    );
+    return suPeekAtLastError();
+}
+
+extern "C" suError_t gsplat_quat_scale_to_covar_preci_bwd_launch(
+    const float *quats,
+    const float *scales,
+    int n,
+    bool triu,
+    const float *v_covars,
+    const float *v_precis,
+    float *v_quats,
+    float *v_scales,
+    suStream_t stream
+) {
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    suLaunchKernel(
+        gsplat_quat_scale_to_covar_preci_bwd_kernel,
+        dim3(blocks),
+        dim3(threads),
+        0,
+        stream,
+        quats,
+        scales,
+        n,
+        triu,
+        v_covars,
+        v_precis,
+        v_quats,
+        v_scales
+    );
+    return suPeekAtLastError();
+}
+
+extern "C" __global__ void gsplat_projection_ewa_3dgs_pinhole_fwd_kernel(
+    const float *means,
+    const float *covars,
+    const float *quats,
+    const float *scales,
+    const float *viewmats,
+    const float *Ks,
+    int B,
+    int C,
+    int N,
+    int image_width,
+    int image_height,
+    float eps2d,
+    float near_plane,
+    float far_plane,
+    bool calc_compensations,
+    int *radii,
+    float *means2d,
+    float *depths,
+    float *conics,
+    float *compensations
+) {
+    int idx = block_idx.x * block_dim.x + thread_idx.x;
+    int total = B * C * N;
+    if (idx >= total) {
+        return;
+    }
+
+    int bid = idx / (C * N);
+    int cid = (idx / N) % C;
+    int gid = idx % N;
+
+    const float *mean = means + (bid * N + gid) * 3;
+    const float *viewmat = viewmats + (bid * C + cid) * 16;
+    const float *K = Ks + (bid * C + cid) * 9;
+
+    Mat3 covar;
+    if (covars != nullptr) {
+        covar = read_full_covar(covars + (bid * N + gid) * 9);
+    } else {
+        const float *quat = quats + (bid * N + gid) * 4;
+        const float *scale = scales + (bid * N + gid) * 3;
+        covar = covar_from_rot_scale(make_rotmat(quat), scale);
+    }
+
+    Vec3 mean_c = transform_point_world_to_cam(mean, viewmat);
+    Mat3 covar_c = transform_covar_world_to_cam(covar, viewmat);
+
+    Mat2 covar2d;
+    float projected[2];
+    project_pinhole(mean_c, covar_c, K, image_width, image_height, covar2d, projected);
+
+    float det_orig = covar2d.v[0] * covar2d.v[3] - covar2d.v[1] * covar2d.v[2];
+    covar2d.v[0] += eps2d;
+    covar2d.v[3] += eps2d;
+    float det = covar2d.v[0] * covar2d.v[3] - covar2d.v[1] * covar2d.v[2];
+    det = fmaxf(det, 1e-10f);
+
+    means2d[idx * 2] = projected[0];
+    means2d[idx * 2 + 1] = projected[1];
+    depths[idx] = mean_c.v[2];
+    conics[idx * 3] = covar2d.v[3] / det;
+    conics[idx * 3 + 1] = -0.5f * (covar2d.v[1] + covar2d.v[2]) / det;
+    conics[idx * 3 + 2] = covar2d.v[0] / det;
+    if (calc_compensations) {
+        float ratio = fmaxf(det_orig / det, GSPLAT_MIN_COMPENSATION * GSPLAT_MIN_COMPENSATION);
+        compensations[idx] = sqrtf(ratio);
+    }
+
+    float radius_x = ceilf(GSPLAT_GAUSSIAN_EXTEND * sqrtf(covar2d.v[0]));
+    float radius_y = ceilf(GSPLAT_GAUSSIAN_EXTEND * sqrtf(covar2d.v[3]));
+    bool valid = mean_c.v[2] > near_plane && mean_c.v[2] < far_plane;
+    bool inside =
+        projected[0] + radius_x > 0.0f && projected[0] - radius_x < static_cast<float>(image_width) &&
+        projected[1] + radius_y > 0.0f && projected[1] - radius_y < static_cast<float>(image_height);
+
+    if (!valid || !inside) {
+        radius_x = 0.0f;
+        radius_y = 0.0f;
+    }
+
+    radii[idx * 2] = static_cast<int>(radius_x);
+    radii[idx * 2 + 1] = static_cast<int>(radius_y);
+}
+
+extern "C" suError_t gsplat_projection_ewa_3dgs_pinhole_fwd_launch(
+    const float *means,
+    const float *covars,
+    const float *quats,
+    const float *scales,
+    const float *viewmats,
+    const float *Ks,
+    int B,
+    int C,
+    int N,
+    int image_width,
+    int image_height,
+    float eps2d,
+    float near_plane,
+    float far_plane,
+    bool calc_compensations,
+    int *radii,
+    float *means2d,
+    float *depths,
+    float *conics,
+    float *compensations,
+    suStream_t stream
+) {
+    int threads = 256;
+    int total = B * C * N;
+    int blocks = (total + threads - 1) / threads;
+    suLaunchKernel(
+        gsplat_projection_ewa_3dgs_pinhole_fwd_kernel,
+        dim3(blocks),
+        dim3(threads),
+        0,
+        stream,
+        means,
+        covars,
+        quats,
+        scales,
+        viewmats,
+        Ks,
+        B,
+        C,
+        N,
+        image_width,
+        image_height,
+        eps2d,
+        near_plane,
+        far_plane,
+        calc_compensations,
+        radii,
+        means2d,
+        depths,
+        conics,
+        compensations
+    );
+    return suPeekAtLastError();
+}
+
+extern "C" __global__ void gsplat_projection_ewa_3dgs_pinhole_bwd_kernel(
+    const float *means,
+    const float *covars,
+    const float *quats,
+    const float *scales,
+    const float *viewmats,
+    const float *Ks,
+    int B,
+    int C,
+    int N,
+    int image_width,
+    int image_height,
+    float eps2d,
+    const int *radii,
+    const float *conics,
+    const float *compensations,
+    const float *v_means2d,
+    const float *v_depths,
+    const float *v_conics,
+    const float *v_compensations,
+    float *v_means,
+    float *v_covars,
+    float *v_quats,
+    float *v_scales,
+    float *v_viewmats
+) {
+    int idx = block_idx.x * block_dim.x + thread_idx.x;
+    int total = B * C * N;
+    if (idx >= total || radii[idx * 2] <= 0 || radii[idx * 2 + 1] <= 0) {
+        return;
+    }
+
+    int bid = idx / (C * N);
+    int cid = (idx / N) % C;
+    int gid = idx % N;
+
+    const float *mean = means + (bid * N + gid) * 3;
+    const float *viewmat = viewmats + (bid * C + cid) * 16;
+    const float *K = Ks + (bid * C + cid) * 9;
+
+    Mat2 conic_blur;
+    conic_blur.v[0] = conics[idx * 3];
+    conic_blur.v[1] = conics[idx * 3 + 1];
+    conic_blur.v[2] = conics[idx * 3 + 1];
+    conic_blur.v[3] = conics[idx * 3 + 2];
+
+    Mat2 v_conic_blur;
+    v_conic_blur.v[0] = v_conics[idx * 3];
+    v_conic_blur.v[1] = 0.5f * v_conics[idx * 3 + 1];
+    v_conic_blur.v[2] = 0.5f * v_conics[idx * 3 + 1];
+    v_conic_blur.v[3] = v_conics[idx * 3 + 2];
+
+    Mat2 v_covar2d = zero_mat2();
+    inverse_mat2_vjp(conic_blur, v_conic_blur, v_covar2d);
+    if (v_compensations != nullptr) {
+        add_blur_vjp(
+            eps2d,
+            conic_blur,
+            compensations[idx],
+            v_compensations[idx],
+            v_covar2d
+        );
+    }
+
+    Vec3 mean_c = transform_point_world_to_cam(mean, viewmat);
+    Mat3 covar;
+    Mat3 covar_rot;
+    const float *quat = nullptr;
+    const float *scale = nullptr;
+    if (covars != nullptr) {
+        covar = read_full_covar(covars + (bid * N + gid) * 9);
+    } else {
+        quat = quats + (bid * N + gid) * 4;
+        scale = scales + (bid * N + gid) * 3;
+        covar_rot = make_rotmat(quat);
+        covar = covar_from_rot_scale(covar_rot, scale);
+    }
+    Mat3 covar_c = transform_covar_world_to_cam(covar, viewmat);
+
+    Vec3 v_mean_c = zero_vec3();
+    Mat3 v_covar_c = zero_mat3();
+    float v_mean2d[2] = {v_means2d[idx * 2], v_means2d[idx * 2 + 1]};
+    project_pinhole_vjp(
+        mean_c,
+        covar_c,
+        K,
+        image_width,
+        image_height,
+        v_covar2d,
+        v_mean2d,
+        v_mean_c,
+        v_covar_c
+    );
+    if (v_depths != nullptr) {
+        v_mean_c.v[2] += v_depths[idx];
+    }
+
+    const bool need_v_mean = v_means != nullptr;
+    const bool need_v_covar =
+        v_covars != nullptr || v_quats != nullptr || v_scales != nullptr;
+    const bool need_v_viewmat = v_viewmats != nullptr;
+    Vec3 v_mean = zero_vec3();
+    Mat3 v_covar = zero_mat3();
+    Mat3 v_r = zero_mat3();
+    Vec3 v_t = zero_vec3();
+    transform_point_world_to_cam_vjp(
+        mean,
+        viewmat,
+        v_mean_c,
+        v_mean,
+        v_r,
+        v_t,
+        need_v_mean,
+        need_v_viewmat
+    );
+    transform_covar_world_to_cam_vjp(
+        covar,
+        viewmat,
+        v_covar_c,
+        v_covar,
+        v_r,
+        need_v_covar,
+        need_v_viewmat
+    );
+
+    if (v_means != nullptr) {
+        float *v_mean_out = v_means + (bid * N + gid) * 3;
+#pragma unroll
+        for (int i = 0; i < 3; ++i) {
+            atomicAdd(v_mean_out + i, v_mean.v[i]);
+        }
+    }
+
+    if (v_covars != nullptr) {
+        float *v_covar_out = v_covars + (bid * N + gid) * 9;
+#pragma unroll
+        for (int i = 0; i < 9; ++i) {
+            atomicAdd(v_covar_out + i, v_covar.v[i]);
+        }
+    } else if (v_quats != nullptr || v_scales != nullptr) {
+        float vq[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float vs[3] = {0.0f, 0.0f, 0.0f};
+        add_covar_vjp(quat, scale, covar_rot, v_covar, vq, vs);
+        if (v_quats != nullptr) {
+            float *v_quat_out = v_quats + (bid * N + gid) * 4;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                atomicAdd(v_quat_out + i, vq[i]);
+            }
+        }
+        if (v_scales != nullptr) {
+            float *v_scale_out = v_scales + (bid * N + gid) * 3;
+#pragma unroll
+            for (int i = 0; i < 3; ++i) {
+                atomicAdd(v_scale_out + i, vs[i]);
+            }
+        }
+    }
+
+    if (v_viewmats == nullptr) {
+        return;
+    }
+    float *v_viewmat_out = v_viewmats + (bid * C + cid) * 16;
+#pragma unroll
+    for (int row = 0; row < 3; ++row) {
+#pragma unroll
+        for (int col = 0; col < 3; ++col) {
+            atomicAdd(v_viewmat_out + row * 4 + col, v_r.v[row * 3 + col]);
+        }
+        atomicAdd(v_viewmat_out + row * 4 + 3, v_t.v[row]);
+    }
+}
+
+extern "C" suError_t gsplat_projection_ewa_3dgs_pinhole_bwd_launch(
+    const float *means,
+    const float *covars,
+    const float *quats,
+    const float *scales,
+    const float *viewmats,
+    const float *Ks,
+    int B,
+    int C,
+    int N,
+    int image_width,
+    int image_height,
+    float eps2d,
+    const int *radii,
+    const float *conics,
+    const float *compensations,
+    const float *v_means2d,
+    const float *v_depths,
+    const float *v_conics,
+    const float *v_compensations,
+    float *v_means,
+    float *v_covars,
+    float *v_quats,
+    float *v_scales,
+    float *v_viewmats,
+    suStream_t stream
+) {
+    int threads = 64;
+    int total = B * C * N;
+    int blocks = (total + threads - 1) / threads;
+    suLaunchKernel(
+        gsplat_projection_ewa_3dgs_pinhole_bwd_kernel,
+        dim3(blocks),
+        dim3(threads),
+        0,
+        stream,
+        means,
+        covars,
+        quats,
+        scales,
+        viewmats,
+        Ks,
+        B,
+        C,
+        N,
+        image_width,
+        image_height,
+        eps2d,
+        radii,
+        conics,
+        compensations,
+        v_means2d,
+        v_depths,
+        v_conics,
+        v_compensations,
+        v_means,
+        v_covars,
+        v_quats,
+        v_scales,
+        v_viewmats
+    );
+    return suPeekAtLastError();
+}
+
+extern "C" __global__ void gsplat_tile_count_unpacked_kernel(
+    const float *means2d,
+    const int *radii,
+    int I,
+    int N,
+    int tile_size,
+    int tile_width,
+    int tile_height,
+    int *tiles_per_gauss
+) {
+    int idx = block_idx.x * block_dim.x + thread_idx.x;
+    int total = I * N;
+    if (idx >= total) {
+        return;
+    }
+
+    int rx = radii[idx * 2];
+    int ry = radii[idx * 2 + 1];
+    if (rx <= 0 || ry <= 0) {
+        tiles_per_gauss[idx] = 0;
+        return;
+    }
+
+    float inv_tile_size = 1.0f / static_cast<float>(tile_size);
+    float tile_x = means2d[idx * 2] * inv_tile_size;
+    float tile_y = means2d[idx * 2 + 1] * inv_tile_size;
+    float tile_radius_x = static_cast<float>(rx) * inv_tile_size;
+    float tile_radius_y = static_cast<float>(ry) * inv_tile_size;
+
+    int tile_min_x = clampi(static_cast<int>(floorf(tile_x - tile_radius_x)), 0, tile_width);
+    int tile_min_y = clampi(static_cast<int>(floorf(tile_y - tile_radius_y)), 0, tile_height);
+    int tile_max_x = clampi(static_cast<int>(ceilf(tile_x + tile_radius_x)), 0, tile_width);
+    int tile_max_y = clampi(static_cast<int>(ceilf(tile_y + tile_radius_y)), 0, tile_height);
+
+    tiles_per_gauss[idx] = (tile_max_x - tile_min_x) * (tile_max_y - tile_min_y);
+}
+
+extern "C" suError_t gsplat_tile_count_unpacked_launch(
+    const float *means2d,
+    const int *radii,
+    int I,
+    int N,
+    int tile_size,
+    int tile_width,
+    int tile_height,
+    int *tiles_per_gauss,
+    suStream_t stream
+) {
+    int threads = 256;
+    int total = I * N;
+    int blocks = (total + threads - 1) / threads;
+    suLaunchKernel(
+        gsplat_tile_count_unpacked_kernel,
+        dim3(blocks),
+        dim3(threads),
+        0,
+        stream,
+        means2d,
+        radii,
+        I,
+        N,
+        tile_size,
+        tile_width,
+        tile_height,
+        tiles_per_gauss
+    );
+    return suPeekAtLastError();
+}
+
+extern "C" __global__ void gsplat_tile_count_alpha_unpacked_kernel(
+    const float *means2d,
+    const int *radii,
+    const float *conics,
+    const float *opacities,
+    float alpha_threshold,
+    int I,
+    int N,
+    int tile_size,
+    int tile_width,
+    int tile_height,
+    int *tiles_per_gauss
+) {
+    int idx = block_idx.x * block_dim.x + thread_idx.x;
+    int total = I * N;
+    if (idx >= total) {
+        return;
+    }
+
+    TileBounds bounds = alpha_threshold_tile_bounds(
+        means2d,
+        radii,
+        conics,
+        opacities,
+        idx,
+        tile_size,
+        tile_width,
+        tile_height,
+        alpha_threshold
+    );
+    tiles_per_gauss[idx] = bounds.valid
+        ? (bounds.max_x - bounds.min_x) * (bounds.max_y - bounds.min_y)
+        : 0;
+}
+
+extern "C" suError_t gsplat_tile_count_alpha_unpacked_launch(
+    const float *means2d,
+    const int *radii,
+    const float *conics,
+    const float *opacities,
+    float alpha_threshold,
+    int I,
+    int N,
+    int tile_size,
+    int tile_width,
+    int tile_height,
+    int *tiles_per_gauss,
+    suStream_t stream
+) {
+    int threads = 256;
+    int total = I * N;
+    int blocks = (total + threads - 1) / threads;
+    suLaunchKernel(
+        gsplat_tile_count_alpha_unpacked_kernel,
+        dim3(blocks),
+        dim3(threads),
+        0,
+        stream,
+        means2d,
+        radii,
+        conics,
+        opacities,
+        alpha_threshold,
+        I,
+        N,
+        tile_size,
+        tile_width,
+        tile_height,
+        tiles_per_gauss
+    );
+    return suPeekAtLastError();
+}
+
+extern "C" __global__ void gsplat_visible_compact_mark_kernel(
+    const int *radii,
+    const float *depths,
+    int total,
+    int N,
+    int *visible_flags
+) {
+    int idx = block_idx.x * block_dim.x + thread_idx.x;
+    if (idx >= total) {
+        return;
+    }
+
+    int rx = radii[idx * 2];
+    int ry = radii[idx * 2 + 1];
+    float depth = depths[idx];
+    if (rx > 0 && ry > 0 && isfinite(depth)) {
+        atomicOr(visible_flags + (idx % N), 1);
+    }
+}
+
+extern "C" suError_t gsplat_visible_compact_mark_launch(
+    const int *radii,
+    const float *depths,
+    int I,
+    int N,
+    int *visible_flags,
+    suStream_t stream
+) {
+    int threads = 256;
+    int total = I * N;
+    int blocks = (total + threads - 1) / threads;
+    suLaunchKernel(
+        gsplat_visible_compact_mark_kernel,
+        dim3(blocks),
+        dim3(threads),
+        0,
+        stream,
+        radii,
+        depths,
+        total,
+        N,
+        visible_flags
+    );
+    return suPeekAtLastError();
+}
+
+extern "C" __global__ void gsplat_visible_compact_ids_kernel(
+    const int *visible_flags,
+    int N,
+    int *compact_ids,
+    int *visible_count
+) {
+    int idx = block_idx.x * block_dim.x + thread_idx.x;
+    if (idx >= N || visible_flags[idx] == 0) {
+        return;
+    }
+    int out = atomicAdd(visible_count, 1);
+    compact_ids[out] = idx;
+}
+
+extern "C" suError_t gsplat_visible_compact_ids_launch(
+    const int *visible_flags,
+    int N,
+    int *compact_ids,
+    int *visible_count,
+    suStream_t stream
+) {
+    int threads = 256;
+    int blocks = (N + threads - 1) / threads;
+    suLaunchKernel(
+        gsplat_visible_compact_ids_kernel,
+        dim3(blocks),
+        dim3(threads),
+        0,
+        stream,
+        visible_flags,
+        N,
+        compact_ids,
+        visible_count
+    );
+    return suPeekAtLastError();
+}
+
+extern "C" __global__ void gsplat_compact_select_fwd_kernel(
+    const float *input,
+    const int *compact_ids,
+    int outer,
+    int N,
+    int K,
+    int row_size,
+    float *output
+) {
+    int idx = block_idx.x * block_dim.x + thread_idx.x;
+    int total = outer * K * row_size;
+    if (idx >= total) {
+        return;
+    }
+
+    int col = idx % row_size;
+    int row = idx / row_size;
+    int compact_row = row % K;
+    int outer_id = row / K;
+    int gaussian_id = compact_ids[compact_row];
+    output[idx] = input[(outer_id * N + gaussian_id) * row_size + col];
+}
+
+extern "C" suError_t gsplat_compact_select_fwd_launch(
+    const float *input,
+    const int *compact_ids,
+    int outer,
+    int N,
+    int K,
+    int row_size,
+    float *output,
+    suStream_t stream
+) {
+    int threads = 256;
+    int total = outer * K * row_size;
+    int blocks = (total + threads - 1) / threads;
+    suLaunchKernel(
+        gsplat_compact_select_fwd_kernel,
+        dim3(blocks),
+        dim3(threads),
+        0,
+        stream,
+        input,
+        compact_ids,
+        outer,
+        N,
+        K,
+        row_size,
+        output
+    );
+    return suPeekAtLastError();
+}
+
+extern "C" __global__ void gsplat_compact_select_bwd_kernel(
+    const float *grad_output,
+    const int *compact_ids,
+    int outer,
+    int N,
+    int K,
+    int row_size,
+    float *grad_input
+) {
+    int idx = block_idx.x * block_dim.x + thread_idx.x;
+    int total = outer * K * row_size;
+    if (idx >= total) {
+        return;
+    }
+
+    int col = idx % row_size;
+    int row = idx / row_size;
+    int compact_row = row % K;
+    int outer_id = row / K;
+    int gaussian_id = compact_ids[compact_row];
+    grad_input[(outer_id * N + gaussian_id) * row_size + col] = grad_output[idx];
+}
+
+extern "C" suError_t gsplat_compact_select_bwd_launch(
+    const float *grad_output,
+    const int *compact_ids,
+    int outer,
+    int N,
+    int K,
+    int row_size,
+    float *grad_input,
+    suStream_t stream
+) {
+    int threads = 256;
+    int total = outer * K * row_size;
+    int blocks = (total + threads - 1) / threads;
+    suLaunchKernel(
+        gsplat_compact_select_bwd_kernel,
+        dim3(blocks),
+        dim3(threads),
+        0,
+        stream,
+        grad_output,
+        compact_ids,
+        outer,
+        N,
+        K,
+        row_size,
+        grad_input
+    );
+    return suPeekAtLastError();
+}
+
+extern "C" __global__ void gsplat_isect_tiles_unpacked_lanes_kernel(
+    const float *means2d,
+    const int *radii,
+    const float *depths,
+    const int *tiles_per_gauss,
+    const int *starts,
+    int total,
+    int n_per_image,
+    int tile_size,
+    int tile_width,
+    int tile_height,
+    int tile_n_bits,
+    int *dense_tile_ids,
+    int *flatten_ids,
+    int *isect_ids_hi,
+    int *isect_ids_lo
+) {
+    int idx = block_idx.x * block_dim.x + thread_idx.x;
+    if (idx >= total) {
+        return;
+    }
+
+    int count = tiles_per_gauss[idx];
+    if (count <= 0) {
+        return;
+    }
+
+    float inv_tile_size = 1.0f / static_cast<float>(tile_size);
+    float tile_x = means2d[idx * 2] * inv_tile_size;
+    float tile_y = means2d[idx * 2 + 1] * inv_tile_size;
+    float tile_radius_x = static_cast<float>(radii[idx * 2]) * inv_tile_size;
+    float tile_radius_y = static_cast<float>(radii[idx * 2 + 1]) * inv_tile_size;
+
+    int tile_min_x = clampi(static_cast<int>(floorf(tile_x - tile_radius_x)), 0, tile_width);
+    int tile_min_y = clampi(static_cast<int>(floorf(tile_y - tile_radius_y)), 0, tile_height);
+    int tile_max_x = clampi(static_cast<int>(ceilf(tile_x + tile_radius_x)), 0, tile_width);
+    int tile_max_y = clampi(static_cast<int>(ceilf(tile_y + tile_radius_y)), 0, tile_height);
+    int local_tile_width = tile_max_x - tile_min_x;
+    if (local_tile_width <= 0 || tile_max_y <= tile_min_y) {
+        return;
+    }
+
+    int image_id = idx / n_per_image;
+    int start = starts[idx];
+    union FloatBits {
+        float f;
+        int i;
+    };
+    FloatBits depth_bits;
+    depth_bits.f = depths[idx];
+    for (int local = 0; local < count; ++local) {
+        int local_y = local / local_tile_width;
+        int local_x = local - local_y * local_tile_width;
+        int tile_id = (tile_min_y + local_y) * tile_width + (tile_min_x + local_x);
+        int out = start + local;
+        dense_tile_ids[out] = image_id * (tile_width * tile_height) + tile_id;
+        flatten_ids[out] = idx;
+        isect_ids_hi[out] = (image_id << tile_n_bits) | tile_id;
+        isect_ids_lo[out] = depth_bits.i;
+    }
+}
+
+extern "C" suError_t gsplat_isect_tiles_unpacked_lanes_launch(
+    const float *means2d,
+    const int *radii,
+    const float *depths,
+    const int *tiles_per_gauss,
+    const int *starts,
+    int I,
+    int N,
+    int tile_size,
+    int tile_width,
+    int tile_height,
+    int tile_n_bits,
+    int *dense_tile_ids,
+    int *flatten_ids,
+    int *isect_ids_hi,
+    int *isect_ids_lo,
+    suStream_t stream
+) {
+    int threads = 256;
+    int total = I * N;
+    int blocks = (total + threads - 1) / threads;
+    suLaunchKernel(
+        gsplat_isect_tiles_unpacked_lanes_kernel,
+        dim3(blocks),
+        dim3(threads),
+        0,
+        stream,
+        means2d,
+        radii,
+        depths,
+        tiles_per_gauss,
+        starts,
+        total,
+        N,
+        tile_size,
+        tile_width,
+        tile_height,
+        tile_n_bits,
+        dense_tile_ids,
+        flatten_ids,
+        isect_ids_hi,
+        isect_ids_lo
+    );
+    return suPeekAtLastError();
+}
+
+extern "C" __global__ void gsplat_isect_tiles_alpha_unpacked_lanes_kernel(
+    const float *means2d,
+    const int *radii,
+    const float *depths,
+    const float *conics,
+    const float *opacities,
+    const int *tiles_per_gauss,
+    const int *starts,
+    float alpha_threshold,
+    int total,
+    int n_per_image,
+    int tile_size,
+    int tile_width,
+    int tile_height,
+    int tile_n_bits,
+    int *dense_tile_ids,
+    int *flatten_ids,
+    int *isect_ids_hi,
+    int *isect_ids_lo
+) {
+    int idx = block_idx.x * block_dim.x + thread_idx.x;
+    if (idx >= total) {
+        return;
+    }
+
+    int count = tiles_per_gauss[idx];
+    if (count <= 0) {
+        return;
+    }
+
+    TileBounds bounds = alpha_threshold_tile_bounds(
+        means2d,
+        radii,
+        conics,
+        opacities,
+        idx,
+        tile_size,
+        tile_width,
+        tile_height,
+        alpha_threshold
+    );
+    int local_tile_width = bounds.max_x - bounds.min_x;
+    if (!bounds.valid || local_tile_width <= 0 || bounds.max_y <= bounds.min_y) {
+        return;
+    }
+
+    int image_id = idx / n_per_image;
+    int start = starts[idx];
+    union FloatBits {
+        float f;
+        int i;
+    };
+    FloatBits depth_bits;
+    depth_bits.f = depths[idx];
+    for (int local = 0; local < count; ++local) {
+        int local_y = local / local_tile_width;
+        int local_x = local - local_y * local_tile_width;
+        int tile_id = (bounds.min_y + local_y) * tile_width + (bounds.min_x + local_x);
+        int out = start + local;
+        dense_tile_ids[out] = image_id * (tile_width * tile_height) + tile_id;
+        flatten_ids[out] = idx;
+        isect_ids_hi[out] = (image_id << tile_n_bits) | tile_id;
+        isect_ids_lo[out] = depth_bits.i;
+    }
+}
+
+extern "C" suError_t gsplat_isect_tiles_alpha_unpacked_lanes_launch(
+    const float *means2d,
+    const int *radii,
+    const float *depths,
+    const float *conics,
+    const float *opacities,
+    const int *tiles_per_gauss,
+    const int *starts,
+    float alpha_threshold,
+    int I,
+    int N,
+    int tile_size,
+    int tile_width,
+    int tile_height,
+    int tile_n_bits,
+    int *dense_tile_ids,
+    int *flatten_ids,
+    int *isect_ids_hi,
+    int *isect_ids_lo,
+    suStream_t stream
+) {
+    int threads = 256;
+    int total = I * N;
+    int blocks = (total + threads - 1) / threads;
+    suLaunchKernel(
+        gsplat_isect_tiles_alpha_unpacked_lanes_kernel,
+        dim3(blocks),
+        dim3(threads),
+        0,
+        stream,
+        means2d,
+        radii,
+        depths,
+        conics,
+        opacities,
+        tiles_per_gauss,
+        starts,
+        alpha_threshold,
+        total,
+        N,
+        tile_size,
+        tile_width,
+        tile_height,
+        tile_n_bits,
+        dense_tile_ids,
+        flatten_ids,
+        isect_ids_hi,
+        isect_ids_lo
+    );
+    return suPeekAtLastError();
+}
+
+extern "C" __global__ void gsplat_tiled_offsets_count_kernel(
+    const int *dense_tile_ids,
+    int n_isects,
+    int n_tiles,
+    int *tile_counts
+) {
+    int idx = block_idx.x * block_dim.x + thread_idx.x;
+    if (idx >= n_isects) {
+        return;
+    }
+
+    int tile_id = dense_tile_ids[idx];
+    if (tile_id >= 0 && tile_id < n_tiles) {
+        atomicAdd(tile_counts + tile_id, 1);
+    }
+}
+
+extern "C" suError_t gsplat_tiled_offsets_count_launch(
+    const int *dense_tile_ids,
+    int n_isects,
+    int n_tiles,
+    int *tile_counts,
+    suStream_t stream
+) {
+    int threads = 256;
+    int blocks = (n_isects + threads - 1) / threads;
+    suLaunchKernel(
+        gsplat_tiled_offsets_count_kernel,
+        dim3(blocks),
+        dim3(threads),
+        0,
+        stream,
+        dense_tile_ids,
+        n_isects,
+        n_tiles,
+        tile_counts
+    );
+    return suPeekAtLastError();
+}
+
+extern "C" __global__ void gsplat_tiled_offsets_prefix_kernel(
+    const int *tile_counts,
+    int n_tiles,
+    int *tile_offsets,
+    int *tile_cursors
+) {
+    if (block_idx.x != 0 || thread_idx.x != 0) {
+        return;
+    }
+
+    int running = 0;
+    for (int tile_id = 0; tile_id < n_tiles; ++tile_id) {
+        tile_offsets[tile_id] = running;
+        tile_cursors[tile_id] = running;
+        running += tile_counts[tile_id];
+    }
+}
+
+extern "C" suError_t gsplat_tiled_offsets_prefix_launch(
+    const int *tile_counts,
+    int n_tiles,
+    int *tile_offsets,
+    int *tile_cursors,
+    suStream_t stream
+) {
+    suLaunchKernel(
+        gsplat_tiled_offsets_prefix_kernel,
+        dim3(1),
+        dim3(1),
+        0,
+        stream,
+        tile_counts,
+        n_tiles,
+        tile_offsets,
+        tile_cursors
+    );
+    return suPeekAtLastError();
+}
+
+extern "C" __global__ void gsplat_tiled_offsets_scatter_kernel(
+    const int *dense_tile_ids,
+    const int *flatten_ids,
+    const int *isect_ids_lo,
+    int n_isects,
+    int n_tiles,
+    int *tile_cursors,
+    int *sorted_flatten_ids,
+    int *sorted_isect_ids_lo,
+    int *source_orders
+) {
+    int idx = block_idx.x * block_dim.x + thread_idx.x;
+    if (idx >= n_isects) {
+        return;
+    }
+
+    int tile_id = dense_tile_ids[idx];
+    if (tile_id < 0 || tile_id >= n_tiles) {
+        return;
+    }
+    int out = atomicAdd(tile_cursors + tile_id, 1);
+    sorted_flatten_ids[out] = flatten_ids[idx];
+    sorted_isect_ids_lo[out] = isect_ids_lo[idx];
+    source_orders[out] = idx;
+}
+
+extern "C" suError_t gsplat_tiled_offsets_scatter_launch(
+    const int *dense_tile_ids,
+    const int *flatten_ids,
+    const int *isect_ids_lo,
+    int n_isects,
+    int n_tiles,
+    int *tile_cursors,
+    int *sorted_flatten_ids,
+    int *sorted_isect_ids_lo,
+    int *source_orders,
+    suStream_t stream
+) {
+    int threads = 256;
+    int blocks = (n_isects + threads - 1) / threads;
+    suLaunchKernel(
+        gsplat_tiled_offsets_scatter_kernel,
+        dim3(blocks),
+        dim3(threads),
+        0,
+        stream,
+        dense_tile_ids,
+        flatten_ids,
+        isect_ids_lo,
+        n_isects,
+        n_tiles,
+        tile_cursors,
+        sorted_flatten_ids,
+        sorted_isect_ids_lo,
+        source_orders
+    );
+    return suPeekAtLastError();
+}
+
+static __device__ bool gsplat_tiled_sort_key_less(
+    int lhs_lo,
+    int lhs_order,
+    int rhs_lo,
+    int rhs_order
+) {
+    unsigned int lhs_depth = static_cast<unsigned int>(lhs_lo);
+    unsigned int rhs_depth = static_cast<unsigned int>(rhs_lo);
+    if (lhs_depth != rhs_depth) {
+        return lhs_depth < rhs_depth;
+    }
+    return lhs_order < rhs_order;
+}
+
+extern "C" __global__ void gsplat_tiled_offsets_sort_kernel(
+    int *sorted_flatten_ids,
+    int *sorted_isect_ids_lo,
+    int *source_orders,
+    const int *tile_offsets,
+    int n_tiles,
+    int n_isects
+) {
+    int tile_id = block_idx.x * block_dim.x + thread_idx.x;
+    if (tile_id >= n_tiles) {
+        return;
+    }
+
+    int start = tile_offsets[tile_id];
+    int end = (tile_id + 1 == n_tiles) ? n_isects : tile_offsets[tile_id + 1];
+    for (int i = start + 1; i < end; ++i) {
+        int key_flatten = sorted_flatten_ids[i];
+        int key_lo = sorted_isect_ids_lo[i];
+        int key_order = source_orders[i];
+        int j = i - 1;
+        while (
+            j >= start &&
+            gsplat_tiled_sort_key_less(key_lo, key_order, sorted_isect_ids_lo[j], source_orders[j])
+        ) {
+            sorted_flatten_ids[j + 1] = sorted_flatten_ids[j];
+            sorted_isect_ids_lo[j + 1] = sorted_isect_ids_lo[j];
+            source_orders[j + 1] = source_orders[j];
+            --j;
+        }
+        sorted_flatten_ids[j + 1] = key_flatten;
+        sorted_isect_ids_lo[j + 1] = key_lo;
+        source_orders[j + 1] = key_order;
+    }
+}
+
+extern "C" suError_t gsplat_tiled_offsets_sort_launch(
+    int *sorted_flatten_ids,
+    int *sorted_isect_ids_lo,
+    int *source_orders,
+    const int *tile_offsets,
+    int n_tiles,
+    int n_isects,
+    suStream_t stream
+) {
+    int threads = 128;
+    int blocks = (n_tiles + threads - 1) / threads;
+    suLaunchKernel(
+        gsplat_tiled_offsets_sort_kernel,
+        dim3(blocks),
+        dim3(threads),
+        0,
+        stream,
+        sorted_flatten_ids,
+        sorted_isect_ids_lo,
+        source_orders,
+        tile_offsets,
+        n_tiles,
+        n_isects
+    );
+    return suPeekAtLastError();
+}
+
+extern "C" __global__ void gsplat_rasterize_to_pixels_tiled_fwd_kernel(
+    const float *means2d,
+    const float *conics,
+    const float *features,
+    const float *opacities,
+    const float *backgrounds,
+    const int *tile_offsets,
+    const int *flatten_ids,
+    int n_isects,
+    int I,
+    int channels,
+    int image_width,
+    int image_height,
+    int tile_width,
+    int tile_height,
+    int tile_size,
+    float *render,
+    float *alpha_out
+) {
+    int idx = block_idx.x * block_dim.x + thread_idx.x;
+    int total = I * image_width * image_height;
+    if (idx >= total) {
+        return;
+    }
+
+    int pixel = idx % (image_width * image_height);
+    int image_id = idx / (image_width * image_height);
+    int x = pixel % image_width;
+    int y = pixel / image_width;
+    int tile_x = x / tile_size;
+    int tile_y = y / tile_size;
+    int tile_linear = (image_id * tile_height + tile_y) * tile_width + tile_x;
+    int n_tiles = I * tile_height * tile_width;
+    int range_start = tile_offsets[tile_linear];
+    int range_end = (tile_linear + 1 == n_tiles) ? n_isects : tile_offsets[tile_linear + 1];
+
+    float px = static_cast<float>(x) + 0.5f;
+    float py = static_cast<float>(y) + 0.5f;
+    int base_pixel = (image_id * image_height + y) * image_width + x;
+    float transmittance = 1.0f;
+    float alpha_acc = 0.0f;
+
+    if (channels == 1) {
+        float value = 0.0f;
+        for (int idx_isect = range_start; idx_isect < range_end; ++idx_isect) {
+            int gidx = flatten_ids[idx_isect];
+            float dx = px - means2d[gidx * 2];
+            float dy = py - means2d[gidx * 2 + 1];
+            const float *c = conics + gidx * 3;
+            float sigma = 0.5f * (c[0] * dx * dx + c[2] * dy * dy) + c[1] * dx * dy;
+            float alpha = opacities[gidx] * expf(-sigma);
+            alpha = clampf(alpha, 0.0f, GSPLAT_MAX_ALPHA);
+            float weight = transmittance * alpha;
+            value += weight * features[gidx];
+            alpha_acc += weight;
+            transmittance *= (1.0f - alpha);
+        }
+        if (backgrounds != nullptr) {
+            value += transmittance * backgrounds[image_id];
+        }
+        render[base_pixel] = value;
+        alpha_out[base_pixel] = alpha_acc;
+        return;
+    }
+
+    if (channels == 3) {
+        float r = 0.0f;
+        float g = 0.0f;
+        float b = 0.0f;
+        for (int idx_isect = range_start; idx_isect < range_end; ++idx_isect) {
+            int gidx = flatten_ids[idx_isect];
+            float dx = px - means2d[gidx * 2];
+            float dy = py - means2d[gidx * 2 + 1];
+            const float *c = conics + gidx * 3;
+            float sigma = 0.5f * (c[0] * dx * dx + c[2] * dy * dy) + c[1] * dx * dy;
+            float alpha = opacities[gidx] * expf(-sigma);
+            alpha = clampf(alpha, 0.0f, GSPLAT_MAX_ALPHA);
+            float weight = transmittance * alpha;
+            const float *feature = features + gidx * 3;
+            r += weight * feature[0];
+            g += weight * feature[1];
+            b += weight * feature[2];
+            alpha_acc += weight;
+            transmittance *= (1.0f - alpha);
+        }
+        if (backgrounds != nullptr) {
+            const float *background = backgrounds + image_id * 3;
+            r += transmittance * background[0];
+            g += transmittance * background[1];
+            b += transmittance * background[2];
+        }
+        render[base_pixel * 3] = r;
+        render[base_pixel * 3 + 1] = g;
+        render[base_pixel * 3 + 2] = b;
+        alpha_out[base_pixel] = alpha_acc;
+        return;
+    }
+
+    if (channels == 4) {
+        float v0 = 0.0f;
+        float v1 = 0.0f;
+        float v2 = 0.0f;
+        float v3 = 0.0f;
+        for (int idx_isect = range_start; idx_isect < range_end; ++idx_isect) {
+            int gidx = flatten_ids[idx_isect];
+            float dx = px - means2d[gidx * 2];
+            float dy = py - means2d[gidx * 2 + 1];
+            const float *c = conics + gidx * 3;
+            float sigma = 0.5f * (c[0] * dx * dx + c[2] * dy * dy) + c[1] * dx * dy;
+            float alpha = opacities[gidx] * expf(-sigma);
+            alpha = clampf(alpha, 0.0f, GSPLAT_MAX_ALPHA);
+            float weight = transmittance * alpha;
+            const float *feature = features + gidx * 4;
+            v0 += weight * feature[0];
+            v1 += weight * feature[1];
+            v2 += weight * feature[2];
+            v3 += weight * feature[3];
+            alpha_acc += weight;
+            transmittance *= (1.0f - alpha);
+        }
+        if (backgrounds != nullptr) {
+            const float *background = backgrounds + image_id * 4;
+            v0 += transmittance * background[0];
+            v1 += transmittance * background[1];
+            v2 += transmittance * background[2];
+            v3 += transmittance * background[3];
+        }
+        render[base_pixel * 4] = v0;
+        render[base_pixel * 4 + 1] = v1;
+        render[base_pixel * 4 + 2] = v2;
+        render[base_pixel * 4 + 3] = v3;
+        alpha_out[base_pixel] = alpha_acc;
+        return;
+    }
+
+    if (channels <= GSPLAT_ALPHA_COMPOSITE_MAX_CHANNELS) {
+        float pixel_render[GSPLAT_ALPHA_COMPOSITE_MAX_CHANNELS];
+        for (int ch = 0; ch < channels; ++ch) {
+            pixel_render[ch] = 0.0f;
+        }
+
+        for (int idx_isect = range_start; idx_isect < range_end; ++idx_isect) {
+            int gidx = flatten_ids[idx_isect];
+            float dx = px - means2d[gidx * 2];
+            float dy = py - means2d[gidx * 2 + 1];
+            const float *c = conics + gidx * 3;
+            float sigma = 0.5f * (c[0] * dx * dx + c[2] * dy * dy) + c[1] * dx * dy;
+            float alpha = opacities[gidx] * expf(-sigma);
+            alpha = clampf(alpha, 0.0f, GSPLAT_MAX_ALPHA);
+            float weight = transmittance * alpha;
+            for (int ch = 0; ch < channels; ++ch) {
+                pixel_render[ch] += weight * features[gidx * channels + ch];
+            }
+            alpha_acc += weight;
+            transmittance *= (1.0f - alpha);
+        }
+
+        for (int ch = 0; ch < channels; ++ch) {
+            float value = pixel_render[ch];
+            if (backgrounds != nullptr) {
+                value += transmittance * backgrounds[image_id * channels + ch];
+            }
+            render[base_pixel * channels + ch] = value;
+        }
+        alpha_out[base_pixel] = alpha_acc;
+        return;
+    }
+
+    for (int idx_isect = range_start; idx_isect < range_end; ++idx_isect) {
+        int gidx = flatten_ids[idx_isect];
+        float dx = px - means2d[gidx * 2];
+        float dy = py - means2d[gidx * 2 + 1];
+        const float *c = conics + gidx * 3;
+        float sigma = 0.5f * (c[0] * dx * dx + c[2] * dy * dy) + c[1] * dx * dy;
+        float alpha = opacities[gidx] * expf(-sigma);
+        alpha = clampf(alpha, 0.0f, GSPLAT_MAX_ALPHA);
+        float weight = transmittance * alpha;
+        for (int ch = 0; ch < channels; ++ch) {
+            render[base_pixel * channels + ch] += weight * features[gidx * channels + ch];
+        }
+        alpha_acc += weight;
+        transmittance *= (1.0f - alpha);
+    }
+
+    if (backgrounds != nullptr) {
+        for (int ch = 0; ch < channels; ++ch) {
+            render[base_pixel * channels + ch] += transmittance * backgrounds[image_id * channels + ch];
+        }
+    }
+    alpha_out[base_pixel] = alpha_acc;
+}
+
+extern "C" suError_t gsplat_rasterize_to_pixels_tiled_fwd_launch(
+    const float *means2d,
+    const float *conics,
+    const float *features,
+    const float *opacities,
+    const float *backgrounds,
+    const int *tile_offsets,
+    const int *flatten_ids,
+    int n_isects,
+    int I,
+    int channels,
+    int image_width,
+    int image_height,
+    int tile_width,
+    int tile_height,
+    int tile_size,
+    float *render,
+    float *alpha_out,
+    suStream_t stream
+) {
+    int threads = 256;
+    int total = I * image_width * image_height;
+    int blocks = (total + threads - 1) / threads;
+    suLaunchKernel(
+        gsplat_rasterize_to_pixels_tiled_fwd_kernel,
+        dim3(blocks),
+        dim3(threads),
+        0,
+        stream,
+        means2d,
+        conics,
+        features,
+        opacities,
+        backgrounds,
+        tile_offsets,
+        flatten_ids,
+        n_isects,
+        I,
+        channels,
+        image_width,
+        image_height,
+        tile_width,
+        tile_height,
+        tile_size,
+        render,
+        alpha_out
+    );
+    return suPeekAtLastError();
+}
+
+static __device__ int alpha_composite_order_gid(
+    const float *depths,
+    const int *radii,
+    int base_gauss,
+    int N,
+    int rank
+);
+
+extern "C" __global__ void gsplat_alpha_composite_fwd_kernel(
+    const float *means2d,
+    const float *conics,
+    const float *features,
+    const float *opacities,
+    const float *depths,
+    const int *radii,
+    const int *sorted_ids,
+    const float *backgrounds,
+    int I,
+    int N,
+    int channels,
+    int image_width,
+    int image_height,
+    float *render,
+    float *alpha_out
+) {
+    int idx = block_idx.x * block_dim.x + thread_idx.x;
+    int total = I * image_width * image_height;
+    if (idx >= total) {
+        return;
+    }
+
+    int pixel = idx % (image_width * image_height);
+    int image_id = idx / (image_width * image_height);
+    int x = pixel % image_width;
+    int y = pixel / image_width;
+    float px = static_cast<float>(x) + 0.5f;
+    float py = static_cast<float>(y) + 0.5f;
+
+    float transmittance = 1.0f;
+    float alpha_acc = 0.0f;
+    int base_gauss = image_id * N;
+    int base_pixel = (image_id * image_height + y) * image_width + x;
+
+    if (channels == 1) {
+        float value = 0.0f;
+        for (int rank = 0; rank < N; ++rank) {
+            int best_gid = sorted_ids != nullptr
+                ? sorted_ids[base_gauss + rank]
+                : alpha_composite_order_gid(depths, radii, base_gauss, N, rank);
+            if (best_gid < 0) {
+                break;
+            }
+
+            int gidx = base_gauss + best_gid;
+            int rx = radii[gidx * 2];
+            int ry = radii[gidx * 2 + 1];
+            float depth = depths[gidx];
+            if (rx <= 0 || ry <= 0 || !isfinite(depth)) {
+                continue;
+            }
+            float dx = px - means2d[gidx * 2];
+            float dy = py - means2d[gidx * 2 + 1];
+            const float *c = conics + gidx * 3;
+            float sigma = 0.5f * (c[0] * dx * dx + c[2] * dy * dy) + c[1] * dx * dy;
+            float alpha = opacities[gidx] * expf(-sigma);
+            alpha = clampf(alpha, 0.0f, GSPLAT_MAX_ALPHA);
+            float weight = transmittance * alpha;
+            value += weight * features[gidx];
+            alpha_acc += weight;
+            transmittance *= (1.0f - alpha);
+        }
+
+        if (backgrounds != nullptr) {
+            value += transmittance * backgrounds[image_id];
+        }
+        render[base_pixel] = value;
+        alpha_out[base_pixel] = alpha_acc;
+        return;
+    }
+
+    if (channels == 3) {
+        float r = 0.0f;
+        float g = 0.0f;
+        float b = 0.0f;
+        for (int rank = 0; rank < N; ++rank) {
+            int best_gid = sorted_ids != nullptr
+                ? sorted_ids[base_gauss + rank]
+                : alpha_composite_order_gid(depths, radii, base_gauss, N, rank);
+            if (best_gid < 0) {
+                break;
+            }
+
+            int gidx = base_gauss + best_gid;
+            int rx = radii[gidx * 2];
+            int ry = radii[gidx * 2 + 1];
+            float depth = depths[gidx];
+            if (rx <= 0 || ry <= 0 || !isfinite(depth)) {
+                continue;
+            }
+            float dx = px - means2d[gidx * 2];
+            float dy = py - means2d[gidx * 2 + 1];
+            const float *c = conics + gidx * 3;
+            float sigma = 0.5f * (c[0] * dx * dx + c[2] * dy * dy) + c[1] * dx * dy;
+            float alpha = opacities[gidx] * expf(-sigma);
+            alpha = clampf(alpha, 0.0f, GSPLAT_MAX_ALPHA);
+            float weight = transmittance * alpha;
+            const float *feature = features + gidx * 3;
+            r += weight * feature[0];
+            g += weight * feature[1];
+            b += weight * feature[2];
+            alpha_acc += weight;
+            transmittance *= (1.0f - alpha);
+        }
+
+        if (backgrounds != nullptr) {
+            const float *background = backgrounds + image_id * 3;
+            r += transmittance * background[0];
+            g += transmittance * background[1];
+            b += transmittance * background[2];
+        }
+        render[base_pixel * 3] = r;
+        render[base_pixel * 3 + 1] = g;
+        render[base_pixel * 3 + 2] = b;
+        alpha_out[base_pixel] = alpha_acc;
+        return;
+    }
+
+    if (channels == 4) {
+        float v0 = 0.0f;
+        float v1 = 0.0f;
+        float v2 = 0.0f;
+        float v3 = 0.0f;
+        for (int rank = 0; rank < N; ++rank) {
+            int best_gid = sorted_ids != nullptr
+                ? sorted_ids[base_gauss + rank]
+                : alpha_composite_order_gid(depths, radii, base_gauss, N, rank);
+            if (best_gid < 0) {
+                break;
+            }
+
+            int gidx = base_gauss + best_gid;
+            int rx = radii[gidx * 2];
+            int ry = radii[gidx * 2 + 1];
+            float depth = depths[gidx];
+            if (rx <= 0 || ry <= 0 || !isfinite(depth)) {
+                continue;
+            }
+            float dx = px - means2d[gidx * 2];
+            float dy = py - means2d[gidx * 2 + 1];
+            const float *c = conics + gidx * 3;
+            float sigma = 0.5f * (c[0] * dx * dx + c[2] * dy * dy) + c[1] * dx * dy;
+            float alpha = opacities[gidx] * expf(-sigma);
+            alpha = clampf(alpha, 0.0f, GSPLAT_MAX_ALPHA);
+            float weight = transmittance * alpha;
+            const float *feature = features + gidx * 4;
+            v0 += weight * feature[0];
+            v1 += weight * feature[1];
+            v2 += weight * feature[2];
+            v3 += weight * feature[3];
+            alpha_acc += weight;
+            transmittance *= (1.0f - alpha);
+        }
+
+        if (backgrounds != nullptr) {
+            const float *background = backgrounds + image_id * 4;
+            v0 += transmittance * background[0];
+            v1 += transmittance * background[1];
+            v2 += transmittance * background[2];
+            v3 += transmittance * background[3];
+        }
+        render[base_pixel * 4] = v0;
+        render[base_pixel * 4 + 1] = v1;
+        render[base_pixel * 4 + 2] = v2;
+        render[base_pixel * 4 + 3] = v3;
+        alpha_out[base_pixel] = alpha_acc;
+        return;
+    }
+
+    if (channels <= GSPLAT_ALPHA_COMPOSITE_MAX_CHANNELS) {
+        float pixel_render[GSPLAT_ALPHA_COMPOSITE_MAX_CHANNELS];
+        for (int ch = 0; ch < channels; ++ch) {
+            pixel_render[ch] = 0.0f;
+        }
+
+        for (int rank = 0; rank < N; ++rank) {
+            int best_gid = sorted_ids != nullptr
+                ? sorted_ids[base_gauss + rank]
+                : alpha_composite_order_gid(depths, radii, base_gauss, N, rank);
+            if (best_gid < 0) {
+                break;
+            }
+
+            int gidx = base_gauss + best_gid;
+            int rx = radii[gidx * 2];
+            int ry = radii[gidx * 2 + 1];
+            float depth = depths[gidx];
+            if (rx <= 0 || ry <= 0 || !isfinite(depth)) {
+                continue;
+            }
+            float dx = px - means2d[gidx * 2];
+            float dy = py - means2d[gidx * 2 + 1];
+            const float *c = conics + gidx * 3;
+            float sigma = 0.5f * (c[0] * dx * dx + c[2] * dy * dy) + c[1] * dx * dy;
+            float alpha = opacities[gidx] * expf(-sigma);
+            alpha = clampf(alpha, 0.0f, GSPLAT_MAX_ALPHA);
+            float weight = transmittance * alpha;
+            for (int ch = 0; ch < channels; ++ch) {
+                pixel_render[ch] += weight * features[(gidx * channels) + ch];
+            }
+            alpha_acc += weight;
+            transmittance *= (1.0f - alpha);
+        }
+
+        for (int ch = 0; ch < channels; ++ch) {
+            float value = pixel_render[ch];
+            if (backgrounds != nullptr) {
+                value += transmittance * backgrounds[image_id * channels + ch];
+            }
+            render[base_pixel * channels + ch] = value;
+        }
+        alpha_out[base_pixel] = alpha_acc;
+        return;
+    }
+
+    for (int rank = 0; rank < N; ++rank) {
+        int best_gid = sorted_ids != nullptr
+            ? sorted_ids[base_gauss + rank]
+            : alpha_composite_order_gid(depths, radii, base_gauss, N, rank);
+        if (best_gid < 0) {
+            break;
+        }
+
+        int gidx = base_gauss + best_gid;
+        int rx = radii[gidx * 2];
+        int ry = radii[gidx * 2 + 1];
+        float depth = depths[gidx];
+        if (rx <= 0 || ry <= 0 || !isfinite(depth)) {
+            continue;
+        }
+        float dx = px - means2d[gidx * 2];
+        float dy = py - means2d[gidx * 2 + 1];
+        const float *c = conics + gidx * 3;
+        float sigma = 0.5f * (c[0] * dx * dx + c[2] * dy * dy) + c[1] * dx * dy;
+        float alpha = opacities[gidx] * expf(-sigma);
+        alpha = clampf(alpha, 0.0f, GSPLAT_MAX_ALPHA);
+        float weight = transmittance * alpha;
+        for (int ch = 0; ch < channels; ++ch) {
+            render[base_pixel * channels + ch] += weight * features[(gidx * channels) + ch];
+        }
+        alpha_acc += weight;
+        transmittance *= (1.0f - alpha);
+    }
+
+    if (backgrounds != nullptr) {
+        for (int ch = 0; ch < channels; ++ch) {
+            render[base_pixel * channels + ch] += transmittance * backgrounds[image_id * channels + ch];
+        }
+    }
+    alpha_out[base_pixel] = alpha_acc;
+}
+
+static __device__ int alpha_composite_order_gid(
+    const float *depths,
+    const int *radii,
+    int base_gauss,
+    int N,
+    int rank
+) {
+    float best_depth = 3.4028234663852886e38f;
+    int best_gid = -1;
+    for (int gid = 0; gid < N; ++gid) {
+        int gidx = base_gauss + gid;
+        int rx = radii[gidx * 2];
+        int ry = radii[gidx * 2 + 1];
+        if (rx <= 0 || ry <= 0) {
+            continue;
+        }
+        float depth = depths[gidx];
+        if (!isfinite(depth)) {
+            continue;
+        }
+        int before = 0;
+        for (int prev = 0; prev < N; ++prev) {
+            int pidx = base_gauss + prev;
+            int prx = radii[pidx * 2];
+            int pry = radii[pidx * 2 + 1];
+            float pdepth = depths[pidx];
+            if (prx <= 0 || pry <= 0 || !isfinite(pdepth)) {
+                continue;
+            }
+            if (pdepth < depth || (pdepth == depth && prev < gid)) {
+                before += 1;
+            }
+        }
+        if (before == rank && depth < best_depth) {
+            best_depth = depth;
+            best_gid = gid;
+        }
+    }
+    return best_gid;
+}
+
+static __device__ float alpha_composite_gaussian_alpha(
+    const float *means2d,
+    const float *conics,
+    const float *opacities,
+    int gidx,
+    float px,
+    float py,
+    float &dx,
+    float &dy,
+    float &sigma,
+    float &unclamped_alpha,
+    float &exp_sigma
+) {
+    dx = px - means2d[gidx * 2];
+    dy = py - means2d[gidx * 2 + 1];
+    const float *c = conics + gidx * 3;
+    sigma = 0.5f * (c[0] * dx * dx + c[2] * dy * dy) + c[1] * dx * dy;
+    exp_sigma = expf(-sigma);
+    unclamped_alpha = opacities[gidx] * exp_sigma;
+    return clampf(unclamped_alpha, 0.0f, GSPLAT_MAX_ALPHA);
+}
+
+static __device__ void tile_reduce_atomic_add_rgb_grads(
+    int tid,
+    int gidx,
+    float *sh_feature0,
+    float *sh_feature1,
+    float *sh_feature2,
+    float *sh_opacity,
+    float *sh_mean0,
+    float *sh_mean1,
+    float *sh_conic0,
+    float *sh_conic1,
+    float *sh_conic2,
+    float *v_means2d,
+    float *v_conics,
+    float *v_features,
+    float *v_opacities
+) {
+    __syncthreads();
+    for (int stride = GSPLAT_TILED_BWD_TILE_REDUCE_PIXELS / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sh_feature0[tid] += sh_feature0[tid + stride];
+            sh_feature1[tid] += sh_feature1[tid + stride];
+            sh_feature2[tid] += sh_feature2[tid + stride];
+            sh_opacity[tid] += sh_opacity[tid + stride];
+            sh_mean0[tid] += sh_mean0[tid + stride];
+            sh_mean1[tid] += sh_mean1[tid + stride];
+            sh_conic0[tid] += sh_conic0[tid + stride];
+            sh_conic1[tid] += sh_conic1[tid + stride];
+            sh_conic2[tid] += sh_conic2[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        int feature_base = gidx * 3;
+        int mean_base = gidx * 2;
+        int conic_base = gidx * 3;
+        atomicAdd(v_features + feature_base, sh_feature0[0]);
+        atomicAdd(v_features + feature_base + 1, sh_feature1[0]);
+        atomicAdd(v_features + feature_base + 2, sh_feature2[0]);
+        atomicAdd(v_opacities + gidx, sh_opacity[0]);
+        atomicAdd(v_means2d + mean_base, sh_mean0[0]);
+        atomicAdd(v_means2d + mean_base + 1, sh_mean1[0]);
+        atomicAdd(v_conics + conic_base, sh_conic0[0]);
+        atomicAdd(v_conics + conic_base + 1, sh_conic1[0]);
+        atomicAdd(v_conics + conic_base + 2, sh_conic2[0]);
+    }
+    __syncthreads();
+}
+
+extern "C" __global__ void gsplat_rasterize_to_pixels_tiled_bwd_kernel(
+    const float *means2d,
+    const float *conics,
+    const float *features,
+    const float *opacities,
+    const float *backgrounds,
+    const int *tile_offsets,
+    const int *flatten_ids,
+    const float *v_render,
+    const float *v_alpha,
+    const float *forward_alpha,
+    int n_isects,
+    int I,
+    int channels,
+    int image_width,
+    int image_height,
+    int tile_width,
+    int tile_height,
+    int tile_size,
+    int pixel_offset,
+    int pixel_count,
+    float *prefix_checkpoints,
+    int prefix_checkpoint_count,
+    float *v_means2d,
+    float *v_conics,
+    float *v_features,
+    float *v_opacities,
+    float *v_backgrounds
+) {
+    int local_idx = block_idx.x * block_dim.x + thread_idx.x;
+    if (local_idx >= pixel_count) {
+        return;
+    }
+
+    int idx = pixel_offset + local_idx;
+    int pixel = idx % (image_width * image_height);
+    int image_id = idx / (image_width * image_height);
+    int x = pixel % image_width;
+    int y = pixel / image_width;
+    int tile_x = x / tile_size;
+    int tile_y = y / tile_size;
+    int tile_linear = (image_id * tile_height + tile_y) * tile_width + tile_x;
+    int n_tiles = I * tile_height * tile_width;
+    int range_start = tile_offsets[tile_linear];
+    int range_end = (tile_linear + 1 == n_tiles) ? n_isects : tile_offsets[tile_linear + 1];
+    int workspace_base = local_idx * prefix_checkpoint_count;
+
+    float px = static_cast<float>(x) + 0.5f;
+    float py = static_cast<float>(y) + 0.5f;
+    int base_pixel = (image_id * image_height + y) * image_width + x;
+
+    float final_transmittance = 1.0f;
+    if (forward_alpha != nullptr) {
+        final_transmittance = clampf(1.0f - forward_alpha[base_pixel], 0.0f, 1.0f);
+    } else {
+        for (int idx_isect = range_start; idx_isect < range_end; ++idx_isect) {
+            int gidx = flatten_ids[idx_isect];
+            float dx;
+            float dy;
+            float sigma;
+            float unclamped_alpha;
+            float exp_sigma;
+            float alpha = alpha_composite_gaussian_alpha(
+                means2d,
+                conics,
+                opacities,
+                gidx,
+                px,
+                py,
+                dx,
+                dy,
+                sigma,
+                unclamped_alpha,
+                exp_sigma
+            );
+            final_transmittance *= (1.0f - alpha);
+        }
+    }
+
+    if (backgrounds != nullptr) {
+        for (int ch = 0; ch < channels; ++ch) {
+            atomicAdd(
+                v_backgrounds + image_id * channels + ch,
+                final_transmittance * v_render[base_pixel * channels + ch]
+            );
+        }
+    }
+
+    if (channels == 3) {
+        float after_r = backgrounds != nullptr ? backgrounds[image_id * 3] : 0.0f;
+        float after_g = backgrounds != nullptr ? backgrounds[image_id * 3 + 1] : 0.0f;
+        float after_b = backgrounds != nullptr ? backgrounds[image_id * 3 + 2] : 0.0f;
+        bool has_alpha_grad = v_alpha != nullptr;
+        float after_alpha = 0.0f;
+        float pixel_v_alpha = has_alpha_grad ? v_alpha[base_pixel] : 0.0f;
+        int pixel_feature_base = base_pixel * 3;
+        float pixel_v_render0 = v_render[pixel_feature_base];
+        float pixel_v_render1 = v_render[pixel_feature_base + 1];
+        float pixel_v_render2 = v_render[pixel_feature_base + 2];
+
+        if (final_transmittance > 1.0e-12f) {
+            float transmittance = final_transmittance;
+            for (int idx_isect = range_end - 1; idx_isect >= range_start; --idx_isect) {
+                int gidx = flatten_ids[idx_isect];
+
+                float dx;
+                float dy;
+                float sigma;
+                float unclamped_alpha;
+                float exp_sigma;
+                float alpha = alpha_composite_gaussian_alpha(
+                    means2d,
+                    conics,
+                    opacities,
+                    gidx,
+                    px,
+                    py,
+                    dx,
+                    dy,
+                    sigma,
+                    unclamped_alpha,
+                    exp_sigma
+                );
+                transmittance = transmittance / (1.0f - alpha);
+
+                int gaussian_feature_base = gidx * 3;
+                float feature0 = features[gaussian_feature_base];
+                float feature1 = features[gaussian_feature_base + 1];
+                float feature2 = features[gaussian_feature_base + 2];
+                float alpha_scale = transmittance * alpha;
+                float v_alpha_local = has_alpha_grad
+                    ? pixel_v_alpha * transmittance * (1.0f - after_alpha)
+                    : 0.0f;
+                v_alpha_local += pixel_v_render0 * transmittance * (feature0 - after_r);
+                v_alpha_local += pixel_v_render1 * transmittance * (feature1 - after_g);
+                v_alpha_local += pixel_v_render2 * transmittance * (feature2 - after_b);
+                atomicAdd(v_features + gaussian_feature_base, pixel_v_render0 * alpha_scale);
+                atomicAdd(v_features + gaussian_feature_base + 1, pixel_v_render1 * alpha_scale);
+                atomicAdd(v_features + gaussian_feature_base + 2, pixel_v_render2 * alpha_scale);
+
+                if (unclamped_alpha > 0.0f && unclamped_alpha < GSPLAT_MAX_ALPHA) {
+                    float v_sigma = -v_alpha_local * unclamped_alpha;
+                    const float *c = conics + gidx * 3;
+                    atomicAdd(v_opacities + gidx, v_alpha_local * exp_sigma);
+                    atomicAdd(v_means2d + gidx * 2, -v_sigma * (c[0] * dx + c[1] * dy));
+                    atomicAdd(v_means2d + gidx * 2 + 1, -v_sigma * (c[2] * dy + c[1] * dx));
+                    atomicAdd(v_conics + gidx * 3, v_sigma * 0.5f * dx * dx);
+                    atomicAdd(v_conics + gidx * 3 + 1, v_sigma * dx * dy);
+                    atomicAdd(v_conics + gidx * 3 + 2, v_sigma * 0.5f * dy * dy);
+                }
+
+                after_r = alpha * feature0 + (1.0f - alpha) * after_r;
+                after_g = alpha * feature1 + (1.0f - alpha) * after_g;
+                after_b = alpha * feature2 + (1.0f - alpha) * after_b;
+                after_alpha = alpha + (1.0f - alpha) * after_alpha;
+            }
+            return;
+        }
+
+        // Low-transmittance pixels cannot safely recover prefixes by dividing
+        // from the final transmittance. Store one prefix per reverse chunk so
+        // long tile ranges stay linear instead of repeatedly rescanning.
+        float chunk_prefixes[GSPLAT_ALPHA_COMPOSITE_PREFIX_CHECKPOINT_INTERVAL];
+        float checkpoint_transmittance = 1.0f;
+        for (int idx_isect = range_start; idx_isect < range_end; ++idx_isect) {
+            int local_rank = idx_isect - range_start;
+            if (local_rank % GSPLAT_ALPHA_COMPOSITE_PREFIX_CHECKPOINT_INTERVAL == 0) {
+                prefix_checkpoints[
+                    workspace_base + local_rank / GSPLAT_ALPHA_COMPOSITE_PREFIX_CHECKPOINT_INTERVAL
+                ] = checkpoint_transmittance;
+            }
+            int gidx = flatten_ids[idx_isect];
+            float dx;
+            float dy;
+            float sigma;
+            float unclamped_alpha;
+            float exp_sigma;
+            float alpha = alpha_composite_gaussian_alpha(
+                means2d,
+                conics,
+                opacities,
+                gidx,
+                px,
+                py,
+                dx,
+                dy,
+                sigma,
+                unclamped_alpha,
+                exp_sigma
+            );
+            checkpoint_transmittance *= (1.0f - alpha);
+        }
+
+        for (int chunk_end = range_end; chunk_end > range_start;) {
+            int rel_chunk_end = chunk_end - range_start;
+            int chunk_start =
+                range_start +
+                ((rel_chunk_end - 1) / GSPLAT_ALPHA_COMPOSITE_PREFIX_CHECKPOINT_INTERVAL) *
+                    GSPLAT_ALPHA_COMPOSITE_PREFIX_CHECKPOINT_INTERVAL;
+            int local_chunk_start = chunk_start - range_start;
+            float chunk_transmittance =
+                prefix_checkpoints[
+                    workspace_base +
+                    local_chunk_start / GSPLAT_ALPHA_COMPOSITE_PREFIX_CHECKPOINT_INTERVAL
+                ];
+
+            for (int idx_isect = chunk_start; idx_isect < chunk_end; ++idx_isect) {
+                chunk_prefixes[idx_isect - chunk_start] = chunk_transmittance;
+                int gidx = flatten_ids[idx_isect];
+                float dx;
+                float dy;
+                float sigma;
+                float unclamped_alpha;
+                float exp_sigma;
+                float alpha = alpha_composite_gaussian_alpha(
+                    means2d,
+                    conics,
+                    opacities,
+                    gidx,
+                    px,
+                    py,
+                    dx,
+                    dy,
+                    sigma,
+                    unclamped_alpha,
+                    exp_sigma
+                );
+                chunk_transmittance *= (1.0f - alpha);
+            }
+
+            for (int idx_isect = chunk_end - 1; idx_isect >= chunk_start; --idx_isect) {
+                int gidx = flatten_ids[idx_isect];
+                float transmittance = chunk_prefixes[idx_isect - chunk_start];
+
+                float dx;
+                float dy;
+                float sigma;
+                float unclamped_alpha;
+                float exp_sigma;
+                float alpha = alpha_composite_gaussian_alpha(
+                    means2d,
+                    conics,
+                    opacities,
+                    gidx,
+                    px,
+                    py,
+                    dx,
+                    dy,
+                    sigma,
+                    unclamped_alpha,
+                    exp_sigma
+                );
+
+                int gaussian_feature_base = gidx * 3;
+                float feature0 = features[gaussian_feature_base];
+                float feature1 = features[gaussian_feature_base + 1];
+                float feature2 = features[gaussian_feature_base + 2];
+                float alpha_scale = transmittance * alpha;
+                float v_alpha_local = has_alpha_grad
+                    ? pixel_v_alpha * transmittance * (1.0f - after_alpha)
+                    : 0.0f;
+                v_alpha_local += pixel_v_render0 * transmittance * (feature0 - after_r);
+                v_alpha_local += pixel_v_render1 * transmittance * (feature1 - after_g);
+                v_alpha_local += pixel_v_render2 * transmittance * (feature2 - after_b);
+                atomicAdd(v_features + gaussian_feature_base, pixel_v_render0 * alpha_scale);
+                atomicAdd(v_features + gaussian_feature_base + 1, pixel_v_render1 * alpha_scale);
+                atomicAdd(v_features + gaussian_feature_base + 2, pixel_v_render2 * alpha_scale);
+
+                if (unclamped_alpha > 0.0f && unclamped_alpha < GSPLAT_MAX_ALPHA) {
+                    float v_sigma = -v_alpha_local * unclamped_alpha;
+                    const float *c = conics + gidx * 3;
+                    atomicAdd(v_opacities + gidx, v_alpha_local * exp_sigma);
+                    atomicAdd(v_means2d + gidx * 2, -v_sigma * (c[0] * dx + c[1] * dy));
+                    atomicAdd(v_means2d + gidx * 2 + 1, -v_sigma * (c[2] * dy + c[1] * dx));
+                    atomicAdd(v_conics + gidx * 3, v_sigma * 0.5f * dx * dx);
+                    atomicAdd(v_conics + gidx * 3 + 1, v_sigma * dx * dy);
+                    atomicAdd(v_conics + gidx * 3 + 2, v_sigma * 0.5f * dy * dy);
+                }
+
+                after_r = alpha * feature0 + (1.0f - alpha) * after_r;
+                after_g = alpha * feature1 + (1.0f - alpha) * after_g;
+                after_b = alpha * feature2 + (1.0f - alpha) * after_b;
+                after_alpha = alpha + (1.0f - alpha) * after_alpha;
+            }
+            chunk_end = chunk_start;
+        }
+        return;
+    }
+
+    float after_render[GSPLAT_ALPHA_COMPOSITE_MAX_CHANNELS];
+    for (int ch = 0; ch < channels; ++ch) {
+        after_render[ch] = backgrounds != nullptr ? backgrounds[image_id * channels + ch] : 0.0f;
+    }
+    bool has_alpha_grad = v_alpha != nullptr;
+    float after_alpha = 0.0f;
+    float pixel_v_alpha = has_alpha_grad ? v_alpha[base_pixel] : 0.0f;
+
+    if (final_transmittance > 1.0e-12f) {
+        float transmittance = final_transmittance;
+        for (int idx_isect = range_end - 1; idx_isect >= range_start; --idx_isect) {
+            int gidx = flatten_ids[idx_isect];
+
+            float dx;
+            float dy;
+            float sigma;
+            float unclamped_alpha;
+            float exp_sigma;
+            float alpha = alpha_composite_gaussian_alpha(
+                means2d,
+                conics,
+                opacities,
+                gidx,
+                px,
+                py,
+                dx,
+                dy,
+                sigma,
+                unclamped_alpha,
+                exp_sigma
+            );
+            transmittance = transmittance / (1.0f - alpha);
+
+            float v_alpha_local = has_alpha_grad
+                ? pixel_v_alpha * transmittance * (1.0f - after_alpha)
+                : 0.0f;
+            for (int ch = 0; ch < channels; ++ch) {
+                float pixel_v_render = v_render[base_pixel * channels + ch];
+                float feature = features[gidx * channels + ch];
+                v_alpha_local += pixel_v_render * transmittance * (feature - after_render[ch]);
+                atomicAdd(
+                    v_features + gidx * channels + ch,
+                    pixel_v_render * transmittance * alpha
+                );
+            }
+
+            if (unclamped_alpha > 0.0f && unclamped_alpha < GSPLAT_MAX_ALPHA) {
+                float v_sigma = -v_alpha_local * unclamped_alpha;
+                const float *c = conics + gidx * 3;
+                atomicAdd(v_opacities + gidx, v_alpha_local * exp_sigma);
+                atomicAdd(v_means2d + gidx * 2, -v_sigma * (c[0] * dx + c[1] * dy));
+                atomicAdd(v_means2d + gidx * 2 + 1, -v_sigma * (c[2] * dy + c[1] * dx));
+                atomicAdd(v_conics + gidx * 3, v_sigma * 0.5f * dx * dx);
+                atomicAdd(v_conics + gidx * 3 + 1, v_sigma * dx * dy);
+                atomicAdd(v_conics + gidx * 3 + 2, v_sigma * 0.5f * dy * dy);
+            }
+
+            for (int ch = 0; ch < channels; ++ch) {
+                float feature = features[gidx * channels + ch];
+                after_render[ch] = alpha * feature + (1.0f - alpha) * after_render[ch];
+            }
+            after_alpha = alpha + (1.0f - alpha) * after_alpha;
+        }
+        return;
+    }
+
+    // Same checkpoint strategy as the RGB-specialized path above.
+    float chunk_prefixes[GSPLAT_ALPHA_COMPOSITE_PREFIX_CHECKPOINT_INTERVAL];
+    float checkpoint_transmittance = 1.0f;
+    for (int idx_isect = range_start; idx_isect < range_end; ++idx_isect) {
+        int local_rank = idx_isect - range_start;
+        if (local_rank % GSPLAT_ALPHA_COMPOSITE_PREFIX_CHECKPOINT_INTERVAL == 0) {
+            prefix_checkpoints[
+                workspace_base + local_rank / GSPLAT_ALPHA_COMPOSITE_PREFIX_CHECKPOINT_INTERVAL
+            ] = checkpoint_transmittance;
+        }
+        int gidx = flatten_ids[idx_isect];
+        float dx;
+        float dy;
+        float sigma;
+        float unclamped_alpha;
+        float exp_sigma;
+        float alpha = alpha_composite_gaussian_alpha(
+            means2d,
+            conics,
+            opacities,
+            gidx,
+            px,
+            py,
+            dx,
+            dy,
+            sigma,
+            unclamped_alpha,
+            exp_sigma
+        );
+        checkpoint_transmittance *= (1.0f - alpha);
+    }
+
+    for (int chunk_end = range_end; chunk_end > range_start;) {
+        int rel_chunk_end = chunk_end - range_start;
+        int chunk_start =
+            range_start +
+            ((rel_chunk_end - 1) / GSPLAT_ALPHA_COMPOSITE_PREFIX_CHECKPOINT_INTERVAL) *
+                GSPLAT_ALPHA_COMPOSITE_PREFIX_CHECKPOINT_INTERVAL;
+        int local_chunk_start = chunk_start - range_start;
+        float chunk_transmittance =
+            prefix_checkpoints[
+                workspace_base +
+                local_chunk_start / GSPLAT_ALPHA_COMPOSITE_PREFIX_CHECKPOINT_INTERVAL
+            ];
+
+        for (int idx_isect = chunk_start; idx_isect < chunk_end; ++idx_isect) {
+            chunk_prefixes[idx_isect - chunk_start] = chunk_transmittance;
+            int gidx = flatten_ids[idx_isect];
+            float dx;
+            float dy;
+            float sigma;
+            float unclamped_alpha;
+            float exp_sigma;
+            float alpha = alpha_composite_gaussian_alpha(
+                means2d,
+                conics,
+                opacities,
+                gidx,
+                px,
+                py,
+                dx,
+                dy,
+                sigma,
+                unclamped_alpha,
+                exp_sigma
+            );
+            chunk_transmittance *= (1.0f - alpha);
+        }
+
+        for (int idx_isect = chunk_end - 1; idx_isect >= chunk_start; --idx_isect) {
+            int gidx = flatten_ids[idx_isect];
+            float transmittance = chunk_prefixes[idx_isect - chunk_start];
+
+            float dx;
+            float dy;
+            float sigma;
+            float unclamped_alpha;
+            float exp_sigma;
+            float alpha = alpha_composite_gaussian_alpha(
+                means2d,
+                conics,
+                opacities,
+                gidx,
+                px,
+                py,
+                dx,
+                dy,
+                sigma,
+                unclamped_alpha,
+                exp_sigma
+            );
+
+            float v_alpha_local = has_alpha_grad
+                ? pixel_v_alpha * transmittance * (1.0f - after_alpha)
+                : 0.0f;
+            for (int ch = 0; ch < channels; ++ch) {
+                float pixel_v_render = v_render[base_pixel * channels + ch];
+                float feature = features[gidx * channels + ch];
+                v_alpha_local += pixel_v_render * transmittance * (feature - after_render[ch]);
+                atomicAdd(
+                    v_features + gidx * channels + ch,
+                    pixel_v_render * transmittance * alpha
+                );
+            }
+
+            if (unclamped_alpha > 0.0f && unclamped_alpha < GSPLAT_MAX_ALPHA) {
+                float v_sigma = -v_alpha_local * unclamped_alpha;
+                const float *c = conics + gidx * 3;
+                atomicAdd(v_opacities + gidx, v_alpha_local * exp_sigma);
+                atomicAdd(v_means2d + gidx * 2, -v_sigma * (c[0] * dx + c[1] * dy));
+                atomicAdd(v_means2d + gidx * 2 + 1, -v_sigma * (c[2] * dy + c[1] * dx));
+                atomicAdd(v_conics + gidx * 3, v_sigma * 0.5f * dx * dx);
+                atomicAdd(v_conics + gidx * 3 + 1, v_sigma * dx * dy);
+                atomicAdd(v_conics + gidx * 3 + 2, v_sigma * 0.5f * dy * dy);
+            }
+
+            for (int ch = 0; ch < channels; ++ch) {
+                float feature = features[gidx * channels + ch];
+                after_render[ch] = alpha * feature + (1.0f - alpha) * after_render[ch];
+            }
+            after_alpha = alpha + (1.0f - alpha) * after_alpha;
+        }
+        chunk_end = chunk_start;
+    }
+}
+
+extern "C" __global__ void gsplat_rasterize_to_pixels_tiled_bwd_tile_reduce_kernel(
+    const float *means2d,
+    const float *conics,
+    const float *features,
+    const float *opacities,
+    const float *backgrounds,
+    const int *tile_offsets,
+    const int *flatten_ids,
+    const float *v_render,
+    const float *v_alpha,
+    const float *forward_alpha,
+    int n_isects,
+    int I,
+    int image_width,
+    int image_height,
+    int tile_width,
+    int tile_height,
+    int tile_size,
+    int tile_offset,
+    int tile_count,
+    float *prefix_checkpoints,
+    int prefix_checkpoint_count,
+    float *v_means2d,
+    float *v_conics,
+    float *v_features,
+    float *v_opacities,
+    float *v_backgrounds
+) {
+    int tid = thread_idx.x;
+    int local_tile = block_idx.x;
+    if (
+        tid >= GSPLAT_TILED_BWD_TILE_REDUCE_PIXELS ||
+        local_tile >= tile_count ||
+        tile_size != GSPLAT_TILED_BWD_TILE_REDUCE_SIZE
+    ) {
+        return;
+    }
+
+    __shared__ float sh_feature0[GSPLAT_TILED_BWD_TILE_REDUCE_PIXELS];
+    __shared__ float sh_feature1[GSPLAT_TILED_BWD_TILE_REDUCE_PIXELS];
+    __shared__ float sh_feature2[GSPLAT_TILED_BWD_TILE_REDUCE_PIXELS];
+    __shared__ float sh_opacity[GSPLAT_TILED_BWD_TILE_REDUCE_PIXELS];
+    __shared__ float sh_mean0[GSPLAT_TILED_BWD_TILE_REDUCE_PIXELS];
+    __shared__ float sh_mean1[GSPLAT_TILED_BWD_TILE_REDUCE_PIXELS];
+    __shared__ float sh_conic0[GSPLAT_TILED_BWD_TILE_REDUCE_PIXELS];
+    __shared__ float sh_conic1[GSPLAT_TILED_BWD_TILE_REDUCE_PIXELS];
+    __shared__ float sh_conic2[GSPLAT_TILED_BWD_TILE_REDUCE_PIXELS];
+
+    int tile_linear = tile_offset + local_tile;
+    int n_tiles = I * tile_height * tile_width;
+    if (tile_linear >= n_tiles) {
+        return;
+    }
+    int tiles_per_image = tile_height * tile_width;
+    int image_id = tile_linear / tiles_per_image;
+    int image_tile = tile_linear - image_id * tiles_per_image;
+    int tile_y = image_tile / tile_width;
+    int tile_x = image_tile - tile_y * tile_width;
+    int local_x = tid % GSPLAT_TILED_BWD_TILE_REDUCE_SIZE;
+    int local_y = tid / GSPLAT_TILED_BWD_TILE_REDUCE_SIZE;
+    int x = tile_x * GSPLAT_TILED_BWD_TILE_REDUCE_SIZE + local_x;
+    int y = tile_y * GSPLAT_TILED_BWD_TILE_REDUCE_SIZE + local_y;
+    bool valid_pixel = x < image_width && y < image_height;
+
+    int range_start = tile_offsets[tile_linear];
+    int range_end = (tile_linear + 1 == n_tiles) ? n_isects : tile_offsets[tile_linear + 1];
+    int workspace_base =
+        (local_tile * GSPLAT_TILED_BWD_TILE_REDUCE_PIXELS + tid) * prefix_checkpoint_count;
+
+    float px = static_cast<float>(x) + 0.5f;
+    float py = static_cast<float>(y) + 0.5f;
+    int base_pixel = (image_id * image_height + y) * image_width + x;
+
+    float final_transmittance = 1.0f;
+    if (valid_pixel && forward_alpha != nullptr) {
+        final_transmittance = clampf(1.0f - forward_alpha[base_pixel], 0.0f, 1.0f);
+    } else if (valid_pixel) {
+        for (int idx_isect = range_start; idx_isect < range_end; ++idx_isect) {
+            int gidx = flatten_ids[idx_isect];
+            float dx;
+            float dy;
+            float sigma;
+            float unclamped_alpha;
+            float exp_sigma;
+            float alpha = alpha_composite_gaussian_alpha(
+                means2d,
+                conics,
+                opacities,
+                gidx,
+                px,
+                py,
+                dx,
+                dy,
+                sigma,
+                unclamped_alpha,
+                exp_sigma
+            );
+            final_transmittance *= (1.0f - alpha);
+        }
+
+    }
+
+    if (valid_pixel && backgrounds != nullptr) {
+        int pixel_feature_base = base_pixel * 3;
+        atomicAdd(
+            v_backgrounds + image_id * 3,
+            final_transmittance * v_render[pixel_feature_base]
+        );
+        atomicAdd(
+            v_backgrounds + image_id * 3 + 1,
+            final_transmittance * v_render[pixel_feature_base + 1]
+        );
+        atomicAdd(
+            v_backgrounds + image_id * 3 + 2,
+            final_transmittance * v_render[pixel_feature_base + 2]
+        );
+    }
+
+    float after_r = backgrounds != nullptr ? backgrounds[image_id * 3] : 0.0f;
+    float after_g = backgrounds != nullptr ? backgrounds[image_id * 3 + 1] : 0.0f;
+    float after_b = backgrounds != nullptr ? backgrounds[image_id * 3 + 2] : 0.0f;
+    bool has_alpha_grad = v_alpha != nullptr;
+    float after_alpha = 0.0f;
+    float pixel_v_alpha = (valid_pixel && has_alpha_grad) ? v_alpha[base_pixel] : 0.0f;
+    int pixel_feature_base = base_pixel * 3;
+    float pixel_v_render0 = valid_pixel ? v_render[pixel_feature_base] : 0.0f;
+    float pixel_v_render1 = valid_pixel ? v_render[pixel_feature_base + 1] : 0.0f;
+    float pixel_v_render2 = valid_pixel ? v_render[pixel_feature_base + 2] : 0.0f;
+
+    // Always use stored forward prefixes for tile-reduce backward. The old fast
+    // path recovered prefixes by dividing backward from final transmittance;
+    // that is fragile for long tile ranges and makes parallel training depend
+    // on a per-tile numerical branch. The checkpoint path matches the pixel
+    // kernel's stable low-transmittance strategy for every tile.
+    float chunk_prefixes[GSPLAT_ALPHA_COMPOSITE_PREFIX_CHECKPOINT_INTERVAL];
+    float checkpoint_transmittance = 1.0f;
+    for (int idx_isect = range_start; idx_isect < range_end; ++idx_isect) {
+        int local_rank = idx_isect - range_start;
+        if (local_rank % GSPLAT_ALPHA_COMPOSITE_PREFIX_CHECKPOINT_INTERVAL == 0) {
+            prefix_checkpoints[
+                workspace_base + local_rank / GSPLAT_ALPHA_COMPOSITE_PREFIX_CHECKPOINT_INTERVAL
+            ] = checkpoint_transmittance;
+        }
+        int gidx = flatten_ids[idx_isect];
+        float dx;
+        float dy;
+        float sigma;
+        float unclamped_alpha;
+        float exp_sigma;
+        float alpha = alpha_composite_gaussian_alpha(
+            means2d,
+            conics,
+            opacities,
+            gidx,
+            px,
+            py,
+            dx,
+            dy,
+            sigma,
+            unclamped_alpha,
+            exp_sigma
+        );
+        checkpoint_transmittance *= (1.0f - alpha);
+    }
+
+    for (int chunk_end = range_end; chunk_end > range_start;) {
+        int rel_chunk_end = chunk_end - range_start;
+        int chunk_start =
+            range_start +
+            ((rel_chunk_end - 1) / GSPLAT_ALPHA_COMPOSITE_PREFIX_CHECKPOINT_INTERVAL) *
+                GSPLAT_ALPHA_COMPOSITE_PREFIX_CHECKPOINT_INTERVAL;
+        int local_chunk_start = chunk_start - range_start;
+        float chunk_transmittance =
+            prefix_checkpoints[
+                workspace_base +
+                local_chunk_start / GSPLAT_ALPHA_COMPOSITE_PREFIX_CHECKPOINT_INTERVAL
+            ];
+
+        for (int idx_isect = chunk_start; idx_isect < chunk_end; ++idx_isect) {
+            chunk_prefixes[idx_isect - chunk_start] = chunk_transmittance;
+            int gidx = flatten_ids[idx_isect];
+            float dx;
+            float dy;
+            float sigma;
+            float unclamped_alpha;
+            float exp_sigma;
+            float alpha = alpha_composite_gaussian_alpha(
+                means2d,
+                conics,
+                opacities,
+                gidx,
+                px,
+                py,
+                dx,
+                dy,
+                sigma,
+                unclamped_alpha,
+                exp_sigma
+            );
+            chunk_transmittance *= (1.0f - alpha);
+        }
+
+        for (int idx_isect = chunk_end - 1; idx_isect >= chunk_start; --idx_isect) {
+            int gidx = flatten_ids[idx_isect];
+            float transmittance = chunk_prefixes[idx_isect - chunk_start];
+
+            sh_feature0[tid] = 0.0f;
+            sh_feature1[tid] = 0.0f;
+            sh_feature2[tid] = 0.0f;
+            sh_opacity[tid] = 0.0f;
+            sh_mean0[tid] = 0.0f;
+            sh_mean1[tid] = 0.0f;
+            sh_conic0[tid] = 0.0f;
+            sh_conic1[tid] = 0.0f;
+            sh_conic2[tid] = 0.0f;
+
+            float dx;
+            float dy;
+            float sigma;
+            float unclamped_alpha;
+            float exp_sigma;
+            float alpha = alpha_composite_gaussian_alpha(
+                means2d,
+                conics,
+                opacities,
+                gidx,
+                px,
+                py,
+                dx,
+                dy,
+                sigma,
+                unclamped_alpha,
+                exp_sigma
+            );
+
+            int gaussian_feature_base = gidx * 3;
+            float feature0 = features[gaussian_feature_base];
+            float feature1 = features[gaussian_feature_base + 1];
+            float feature2 = features[gaussian_feature_base + 2];
+            float alpha_scale = transmittance * alpha;
+            float v_alpha_local = has_alpha_grad
+                ? pixel_v_alpha * transmittance * (1.0f - after_alpha)
+                : 0.0f;
+            v_alpha_local += pixel_v_render0 * transmittance * (feature0 - after_r);
+            v_alpha_local += pixel_v_render1 * transmittance * (feature1 - after_g);
+            v_alpha_local += pixel_v_render2 * transmittance * (feature2 - after_b);
+            sh_feature0[tid] = pixel_v_render0 * alpha_scale;
+            sh_feature1[tid] = pixel_v_render1 * alpha_scale;
+            sh_feature2[tid] = pixel_v_render2 * alpha_scale;
+
+            if (unclamped_alpha > 0.0f && unclamped_alpha < GSPLAT_MAX_ALPHA) {
+                float v_sigma = -v_alpha_local * unclamped_alpha;
+                const float *c = conics + gidx * 3;
+                sh_opacity[tid] = v_alpha_local * exp_sigma;
+                sh_mean0[tid] = -v_sigma * (c[0] * dx + c[1] * dy);
+                sh_mean1[tid] = -v_sigma * (c[2] * dy + c[1] * dx);
+                sh_conic0[tid] = v_sigma * 0.5f * dx * dx;
+                sh_conic1[tid] = v_sigma * dx * dy;
+                sh_conic2[tid] = v_sigma * 0.5f * dy * dy;
+            }
+
+            tile_reduce_atomic_add_rgb_grads(
+                tid,
+                gidx,
+                sh_feature0,
+                sh_feature1,
+                sh_feature2,
+                sh_opacity,
+                sh_mean0,
+                sh_mean1,
+                sh_conic0,
+                sh_conic1,
+                sh_conic2,
+                v_means2d,
+                v_conics,
+                v_features,
+                v_opacities
+            );
+
+            after_r = alpha * feature0 + (1.0f - alpha) * after_r;
+            after_g = alpha * feature1 + (1.0f - alpha) * after_g;
+            after_b = alpha * feature2 + (1.0f - alpha) * after_b;
+            after_alpha = alpha + (1.0f - alpha) * after_alpha;
+        }
+        chunk_end = chunk_start;
+    }
+}
+
+extern "C" suError_t gsplat_rasterize_to_pixels_tiled_bwd_launch(
+    const float *means2d,
+    const float *conics,
+    const float *features,
+    const float *opacities,
+    const float *backgrounds,
+    const int *tile_offsets,
+    const int *flatten_ids,
+    const float *v_render,
+    const float *v_alpha,
+    const float *forward_alpha,
+    int n_isects,
+    int I,
+    int channels,
+    int image_width,
+    int image_height,
+    int tile_width,
+    int tile_height,
+    int tile_size,
+    int pixel_offset,
+    int pixel_count,
+    float *prefix_checkpoints,
+    int prefix_checkpoint_count,
+    float *v_means2d,
+    float *v_conics,
+    float *v_features,
+    float *v_opacities,
+    float *v_backgrounds,
+    suStream_t stream
+) {
+    if (channels > GSPLAT_ALPHA_COMPOSITE_MAX_CHANNELS) {
+        return suErrorInvalidValue;
+    }
+    int threads = 64;
+    int blocks = (pixel_count + threads - 1) / threads;
+    suLaunchKernel(
+        gsplat_rasterize_to_pixels_tiled_bwd_kernel,
+        dim3(blocks),
+        dim3(threads),
+        0,
+        stream,
+        means2d,
+        conics,
+        features,
+        opacities,
+        backgrounds,
+        tile_offsets,
+        flatten_ids,
+        v_render,
+        v_alpha,
+        forward_alpha,
+        n_isects,
+        I,
+        channels,
+        image_width,
+        image_height,
+        tile_width,
+        tile_height,
+        tile_size,
+        pixel_offset,
+        pixel_count,
+        prefix_checkpoints,
+        prefix_checkpoint_count,
+        v_means2d,
+        v_conics,
+        v_features,
+        v_opacities,
+        v_backgrounds
+    );
+    return suPeekAtLastError();
+}
+
+extern "C" suError_t gsplat_rasterize_to_pixels_tiled_bwd_tile_reduce_launch(
+    const float *means2d,
+    const float *conics,
+    const float *features,
+    const float *opacities,
+    const float *backgrounds,
+    const int *tile_offsets,
+    const int *flatten_ids,
+    const float *v_render,
+    const float *v_alpha,
+    const float *forward_alpha,
+    int n_isects,
+    int I,
+    int image_width,
+    int image_height,
+    int tile_width,
+    int tile_height,
+    int tile_size,
+    int tile_offset,
+    int tile_count,
+    float *prefix_checkpoints,
+    int prefix_checkpoint_count,
+    float *v_means2d,
+    float *v_conics,
+    float *v_features,
+    float *v_opacities,
+    float *v_backgrounds,
+    suStream_t stream
+) {
+    if (tile_size != GSPLAT_TILED_BWD_TILE_REDUCE_SIZE) {
+        return suErrorInvalidValue;
+    }
+    suLaunchKernel(
+        gsplat_rasterize_to_pixels_tiled_bwd_tile_reduce_kernel,
+        dim3(tile_count),
+        dim3(GSPLAT_TILED_BWD_TILE_REDUCE_PIXELS),
+        0,
+        stream,
+        means2d,
+        conics,
+        features,
+        opacities,
+        backgrounds,
+        tile_offsets,
+        flatten_ids,
+        v_render,
+        v_alpha,
+        forward_alpha,
+        n_isects,
+        I,
+        image_width,
+        image_height,
+        tile_width,
+        tile_height,
+        tile_size,
+        tile_offset,
+        tile_count,
+        prefix_checkpoints,
+        prefix_checkpoint_count,
+        v_means2d,
+        v_conics,
+        v_features,
+        v_opacities,
+        v_backgrounds
+    );
+    return suPeekAtLastError();
+}
+
+extern "C" __global__ void gsplat_alpha_composite_bwd_kernel(
+    const float *means2d,
+    const float *conics,
+    const float *features,
+    const float *opacities,
+    const float *depths,
+    const int *radii,
+    const int *sorted_ids,
+    const float *backgrounds,
+    const float *v_render,
+    const float *v_alpha,
+    int I,
+    int N,
+    int channels,
+    int image_width,
+    int image_height,
+    int pixel_offset,
+    int pixel_count,
+    float *prefix_checkpoints,
+    int prefix_checkpoint_count,
+    float *v_means2d,
+    float *v_conics,
+    float *v_features,
+    float *v_opacities,
+    float *v_depths,
+    float *v_backgrounds
+) {
+    int local_idx = block_idx.x * block_dim.x + thread_idx.x;
+    if (local_idx >= pixel_count) {
+        return;
+    }
+
+    int idx = pixel_offset + local_idx;
+    int pixel = idx % (image_width * image_height);
+    int image_id = idx / (image_width * image_height);
+    int x = pixel % image_width;
+    int y = pixel / image_width;
+    float px = static_cast<float>(x) + 0.5f;
+    float py = static_cast<float>(y) + 0.5f;
+    int base_gauss = image_id * N;
+    int base_pixel = (image_id * image_height + y) * image_width + x;
+    int workspace_base = local_idx * prefix_checkpoint_count;
+
+    float final_transmittance = 1.0f;
+    int active_ranks = N;
+    for (int rank = 0; rank < N; ++rank) {
+        if (rank % GSPLAT_ALPHA_COMPOSITE_PREFIX_CHECKPOINT_INTERVAL == 0) {
+            prefix_checkpoints[
+                workspace_base + rank / GSPLAT_ALPHA_COMPOSITE_PREFIX_CHECKPOINT_INTERVAL
+            ] = final_transmittance;
+        }
+        int gid = sorted_ids != nullptr
+            ? sorted_ids[base_gauss + rank]
+            : alpha_composite_order_gid(depths, radii, base_gauss, N, rank);
+        if (gid < 0) {
+            active_ranks = rank;
+            break;
+        }
+        int gidx = base_gauss + gid;
+        int rx = radii[gidx * 2];
+        int ry = radii[gidx * 2 + 1];
+        float depth = depths[gidx];
+        if (rx <= 0 || ry <= 0 || !isfinite(depth)) {
+            continue;
+        }
+        float dx;
+        float dy;
+        float sigma;
+        float unclamped_alpha;
+        float exp_sigma;
+        float alpha = alpha_composite_gaussian_alpha(
+            means2d,
+            conics,
+            opacities,
+            gidx,
+            px,
+            py,
+            dx,
+            dy,
+            sigma,
+            unclamped_alpha,
+            exp_sigma
+        );
+        final_transmittance *= (1.0f - alpha);
+    }
+
+    if (backgrounds != nullptr) {
+        for (int ch = 0; ch < channels; ++ch) {
+            atomicAdd(
+                v_backgrounds + image_id * channels + ch,
+                final_transmittance * v_render[base_pixel * channels + ch]
+            );
+        }
+    }
+
+    if (channels == 3) {
+        float after_r = backgrounds != nullptr ? backgrounds[image_id * 3] : 0.0f;
+        float after_g = backgrounds != nullptr ? backgrounds[image_id * 3 + 1] : 0.0f;
+        float after_b = backgrounds != nullptr ? backgrounds[image_id * 3 + 2] : 0.0f;
+        float after_alpha = 0.0f;
+        float pixel_v_alpha = v_alpha[base_pixel];
+        int pixel_feature_base = base_pixel * 3;
+        float pixel_v_render0 = v_render[pixel_feature_base];
+        float pixel_v_render1 = v_render[pixel_feature_base + 1];
+        float pixel_v_render2 = v_render[pixel_feature_base + 2];
+
+        float chunk_prefixes[GSPLAT_ALPHA_COMPOSITE_PREFIX_CHECKPOINT_INTERVAL];
+        for (int chunk_end = active_ranks; chunk_end > 0;) {
+            int chunk_start =
+                ((chunk_end - 1) / GSPLAT_ALPHA_COMPOSITE_PREFIX_CHECKPOINT_INTERVAL) *
+                GSPLAT_ALPHA_COMPOSITE_PREFIX_CHECKPOINT_INTERVAL;
+            float chunk_transmittance =
+                prefix_checkpoints[
+                    workspace_base + chunk_start / GSPLAT_ALPHA_COMPOSITE_PREFIX_CHECKPOINT_INTERVAL
+                ];
+
+            for (int rank = chunk_start; rank < chunk_end; ++rank) {
+                int local_rank = rank - chunk_start;
+                chunk_prefixes[local_rank] = chunk_transmittance;
+                int gid = sorted_ids != nullptr
+                    ? sorted_ids[base_gauss + rank]
+                    : alpha_composite_order_gid(depths, radii, base_gauss, N, rank);
+                if (gid < 0) {
+                    continue;
+                }
+                int gidx = base_gauss + gid;
+                int rx = radii[gidx * 2];
+                int ry = radii[gidx * 2 + 1];
+                float depth = depths[gidx];
+                if (rx <= 0 || ry <= 0 || !isfinite(depth)) {
+                    continue;
+                }
+                float dx;
+                float dy;
+                float sigma;
+                float unclamped_alpha;
+                float exp_sigma;
+                float alpha = alpha_composite_gaussian_alpha(
+                    means2d,
+                    conics,
+                    opacities,
+                    gidx,
+                    px,
+                    py,
+                    dx,
+                    dy,
+                    sigma,
+                    unclamped_alpha,
+                    exp_sigma
+                );
+                chunk_transmittance *= (1.0f - alpha);
+            }
+
+            for (int rank = chunk_end - 1; rank >= chunk_start; --rank) {
+                int gid = sorted_ids != nullptr
+                    ? sorted_ids[base_gauss + rank]
+                    : alpha_composite_order_gid(depths, radii, base_gauss, N, rank);
+                if (gid < 0) {
+                    continue;
+                }
+                int gidx = base_gauss + gid;
+                int rx = radii[gidx * 2];
+                int ry = radii[gidx * 2 + 1];
+                float depth = depths[gidx];
+                if (rx <= 0 || ry <= 0 || !isfinite(depth)) {
+                    continue;
+                }
+
+                float transmittance = chunk_prefixes[rank - chunk_start];
+
+                float dx;
+                float dy;
+                float sigma;
+                float unclamped_alpha;
+                float exp_sigma;
+                float alpha = alpha_composite_gaussian_alpha(
+                    means2d,
+                    conics,
+                    opacities,
+                    gidx,
+                    px,
+                    py,
+                    dx,
+                    dy,
+                    sigma,
+                    unclamped_alpha,
+                    exp_sigma
+                );
+
+                int gaussian_feature_base = gidx * 3;
+                float feature0 = features[gaussian_feature_base];
+                float feature1 = features[gaussian_feature_base + 1];
+                float feature2 = features[gaussian_feature_base + 2];
+                float alpha_scale = transmittance * alpha;
+                float v_alpha_local = pixel_v_alpha * transmittance * (1.0f - after_alpha);
+                v_alpha_local += pixel_v_render0 * transmittance * (feature0 - after_r);
+                v_alpha_local += pixel_v_render1 * transmittance * (feature1 - after_g);
+                v_alpha_local += pixel_v_render2 * transmittance * (feature2 - after_b);
+                atomicAdd(v_features + gaussian_feature_base, pixel_v_render0 * alpha_scale);
+                atomicAdd(v_features + gaussian_feature_base + 1, pixel_v_render1 * alpha_scale);
+                atomicAdd(v_features + gaussian_feature_base + 2, pixel_v_render2 * alpha_scale);
+
+                if (unclamped_alpha > 0.0f && unclamped_alpha < GSPLAT_MAX_ALPHA) {
+                    float v_sigma = -v_alpha_local * unclamped_alpha;
+                    const float *c = conics + gidx * 3;
+                    atomicAdd(v_opacities + gidx, v_alpha_local * exp_sigma);
+                    atomicAdd(v_means2d + gidx * 2, -v_sigma * (c[0] * dx + c[1] * dy));
+                    atomicAdd(v_means2d + gidx * 2 + 1, -v_sigma * (c[2] * dy + c[1] * dx));
+                    atomicAdd(v_conics + gidx * 3, v_sigma * 0.5f * dx * dx);
+                    atomicAdd(v_conics + gidx * 3 + 1, v_sigma * dx * dy);
+                    atomicAdd(v_conics + gidx * 3 + 2, v_sigma * 0.5f * dy * dy);
+                }
+
+                after_r = alpha * feature0 + (1.0f - alpha) * after_r;
+                after_g = alpha * feature1 + (1.0f - alpha) * after_g;
+                after_b = alpha * feature2 + (1.0f - alpha) * after_b;
+                after_alpha = alpha + (1.0f - alpha) * after_alpha;
+            }
+            chunk_end = chunk_start;
+        }
+        return;
+    }
+
+    float after_render[GSPLAT_ALPHA_COMPOSITE_MAX_CHANNELS];
+    for (int ch = 0; ch < channels; ++ch) {
+        after_render[ch] = backgrounds != nullptr ? backgrounds[image_id * channels + ch] : 0.0f;
+    }
+    float after_alpha = 0.0f;
+    float pixel_v_alpha = v_alpha[base_pixel];
+
+    float chunk_prefixes[GSPLAT_ALPHA_COMPOSITE_PREFIX_CHECKPOINT_INTERVAL];
+    for (int chunk_end = active_ranks; chunk_end > 0;) {
+        int chunk_start =
+            ((chunk_end - 1) / GSPLAT_ALPHA_COMPOSITE_PREFIX_CHECKPOINT_INTERVAL) *
+            GSPLAT_ALPHA_COMPOSITE_PREFIX_CHECKPOINT_INTERVAL;
+        float chunk_transmittance =
+            prefix_checkpoints[
+                workspace_base + chunk_start / GSPLAT_ALPHA_COMPOSITE_PREFIX_CHECKPOINT_INTERVAL
+            ];
+
+        for (int rank = chunk_start; rank < chunk_end; ++rank) {
+            int local_rank = rank - chunk_start;
+            chunk_prefixes[local_rank] = chunk_transmittance;
+            int gid = sorted_ids != nullptr
+                ? sorted_ids[base_gauss + rank]
+                : alpha_composite_order_gid(depths, radii, base_gauss, N, rank);
+            if (gid < 0) {
+                continue;
+            }
+            int gidx = base_gauss + gid;
+            int rx = radii[gidx * 2];
+            int ry = radii[gidx * 2 + 1];
+            float depth = depths[gidx];
+            if (rx <= 0 || ry <= 0 || !isfinite(depth)) {
+                continue;
+            }
+            float dx;
+            float dy;
+            float sigma;
+            float unclamped_alpha;
+            float exp_sigma;
+            float alpha = alpha_composite_gaussian_alpha(
+                means2d,
+                conics,
+                opacities,
+                gidx,
+                px,
+                py,
+                dx,
+                dy,
+                sigma,
+                unclamped_alpha,
+                exp_sigma
+            );
+            chunk_transmittance *= (1.0f - alpha);
+        }
+
+        for (int rank = chunk_end - 1; rank >= chunk_start; --rank) {
+            int gid = sorted_ids != nullptr
+                ? sorted_ids[base_gauss + rank]
+                : alpha_composite_order_gid(depths, radii, base_gauss, N, rank);
+            if (gid < 0) {
+                continue;
+            }
+            int gidx = base_gauss + gid;
+            int rx = radii[gidx * 2];
+            int ry = radii[gidx * 2 + 1];
+            float depth = depths[gidx];
+            if (rx <= 0 || ry <= 0 || !isfinite(depth)) {
+                continue;
+            }
+
+            float transmittance = chunk_prefixes[rank - chunk_start];
+
+            float dx;
+            float dy;
+            float sigma;
+            float unclamped_alpha;
+            float exp_sigma;
+            float alpha = alpha_composite_gaussian_alpha(
+                means2d,
+                conics,
+                opacities,
+                gidx,
+                px,
+                py,
+                dx,
+                dy,
+                sigma,
+                unclamped_alpha,
+                exp_sigma
+            );
+
+            float v_alpha_local = pixel_v_alpha * transmittance * (1.0f - after_alpha);
+            for (int ch = 0; ch < channels; ++ch) {
+                float pixel_v_render = v_render[base_pixel * channels + ch];
+                float feature = features[gidx * channels + ch];
+                v_alpha_local += pixel_v_render * transmittance * (feature - after_render[ch]);
+                atomicAdd(
+                    v_features + gidx * channels + ch,
+                    pixel_v_render * transmittance * alpha
+                );
+            }
+
+            if (unclamped_alpha > 0.0f && unclamped_alpha < GSPLAT_MAX_ALPHA) {
+                float v_sigma = -v_alpha_local * unclamped_alpha;
+                const float *c = conics + gidx * 3;
+                atomicAdd(v_opacities + gidx, v_alpha_local * exp_sigma);
+                atomicAdd(v_means2d + gidx * 2, -v_sigma * (c[0] * dx + c[1] * dy));
+                atomicAdd(v_means2d + gidx * 2 + 1, -v_sigma * (c[2] * dy + c[1] * dx));
+                atomicAdd(v_conics + gidx * 3, v_sigma * 0.5f * dx * dx);
+                atomicAdd(v_conics + gidx * 3 + 1, v_sigma * dx * dy);
+                atomicAdd(v_conics + gidx * 3 + 2, v_sigma * 0.5f * dy * dy);
+            }
+
+            for (int ch = 0; ch < channels; ++ch) {
+                float feature = features[gidx * channels + ch];
+                after_render[ch] = alpha * feature + (1.0f - alpha) * after_render[ch];
+            }
+            after_alpha = alpha + (1.0f - alpha) * after_alpha;
+        }
+        chunk_end = chunk_start;
+    }
+}
+
+extern "C" suError_t gsplat_alpha_composite_fwd_launch(
+    const float *means2d,
+    const float *conics,
+    const float *features,
+    const float *opacities,
+    const float *depths,
+    const int *radii,
+    const int *sorted_ids,
+    const float *backgrounds,
+    int I,
+    int N,
+    int channels,
+    int image_width,
+    int image_height,
+    float *render,
+    float *alpha_out,
+    suStream_t stream
+) {
+    int threads = 256;
+    int total = I * image_width * image_height;
+    int blocks = (total + threads - 1) / threads;
+    suLaunchKernel(
+        gsplat_alpha_composite_fwd_kernel,
+        dim3(blocks),
+        dim3(threads),
+        0,
+        stream,
+        means2d,
+        conics,
+        features,
+        opacities,
+        depths,
+        radii,
+        sorted_ids,
+        backgrounds,
+        I,
+        N,
+        channels,
+        image_width,
+        image_height,
+        render,
+        alpha_out
+    );
+    return suPeekAtLastError();
+}
+
+extern "C" suError_t gsplat_alpha_composite_bwd_launch(
+    const float *means2d,
+    const float *conics,
+    const float *features,
+    const float *opacities,
+    const float *depths,
+    const int *radii,
+    const int *sorted_ids,
+    const float *backgrounds,
+    const float *v_render,
+    const float *v_alpha,
+    int I,
+    int N,
+    int channels,
+    int image_width,
+    int image_height,
+    int pixel_offset,
+    int pixel_count,
+    float *prefix_checkpoints,
+    int prefix_checkpoint_count,
+    float *v_means2d,
+    float *v_conics,
+    float *v_features,
+    float *v_opacities,
+    float *v_depths,
+    float *v_backgrounds,
+    suStream_t stream
+) {
+    if (channels > GSPLAT_ALPHA_COMPOSITE_MAX_CHANNELS) {
+        return suErrorInvalidValue;
+    }
+    int threads = 16;
+    int blocks = (pixel_count + threads - 1) / threads;
+    suLaunchKernel(
+        gsplat_alpha_composite_bwd_kernel,
+        dim3(blocks),
+        dim3(threads),
+        0,
+        stream,
+        means2d,
+        conics,
+        features,
+        opacities,
+        depths,
+        radii,
+        sorted_ids,
+        backgrounds,
+        v_render,
+        v_alpha,
+        I,
+        N,
+        channels,
+        image_width,
+        image_height,
+        pixel_offset,
+        pixel_count,
+        prefix_checkpoints,
+        prefix_checkpoint_count,
+        v_means2d,
+        v_conics,
+        v_features,
+        v_opacities,
+        v_depths,
+        v_backgrounds
+    );
+    return suPeekAtLastError();
+}
